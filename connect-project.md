@@ -1,123 +1,123 @@
-# ТЗ: подключение нового проекта к Claude Code Docker
+# Spec: connecting a new project to Claude Code Docker
 
-Этот документ — техническое задание агенту Claude Code. Пройди по шагам, проанализируй проект, согласуй архитектурные решения с пользователем, создай артефакты, верифицируй.
+This document is a task spec for the Claude Code agent. Walk through the steps, analyze the project, agree on architectural decisions with the user, create the artifacts, then verify.
 
-## Контекст инфраструктуры
+## Infrastructure context
 
-Сетап разделён на две части:
+The setup is split into two parts:
 
-**Общая инфраструктура** (живёт в setup-репозитории):
-- `<setup>/Dockerfile` — образ `cc-image` (база CC-контейнеров).
-- `<setup>/bin/ccd` — обёртка: walk-up по дереву от `$PWD` до предка, у которого есть `<setup>/<basename(ancestor)>/ccd-config.sh`; запуск CC-контейнера для соответствующего проекта. Конфиг живёт в setup-репо, а не в bind-mount проекта (security: иначе CC мог бы менять флаги изнутри сессии).
-- `<setup>/cc-docker-proxy/haproxy.cfg` — конфиг прокси docker API (`tecnativa/docker-socket-proxy` + custom deny-rule на `/containers/create`); поднимается корневым `init.sh` как контейнер `cc-docker-proxy` в `cc-net`. CC-сессии говорят с docker daemon только через него (`DOCKER_HOST=tcp://cc-docker-proxy:2375`).
-- `<setup>/lib/init-helpers.sh` — bash-функции (логирование, идемпотентные docker-проверки).
-- `<setup>/init.sh` — корневой инициализатор: prerequisites, общая сеть `cc-net`, volume `claude-auth`, контейнер `cc-docker-proxy`, сборка `cc-image`, PATH в `~/.bashrc`, цикл по `<setup>/*/init.sh`.
+**Shared infrastructure** (lives in the setup repo):
+- `<setup>/Dockerfile` — `cc-image` (the CC container base image).
+- `<setup>/bin/ccd` — wrapper: walks up from `$PWD` to the ancestor that has `<setup>/<basename(ancestor)>/ccd-config.sh`, then launches the CC container for that project. The config lives in the setup repo, not in the project bind-mount (security: otherwise CC could change its own flags from inside the session).
+- `<setup>/cc-docker-proxy/haproxy.cfg` — config for the docker-API proxy (`tecnativa/docker-socket-proxy` + a custom deny rule on `/containers/create`); the root `init.sh` brings it up as the `cc-docker-proxy` container in `cc-net`. CC sessions talk to the docker daemon only through it (`DOCKER_HOST=tcp://cc-docker-proxy:2375`).
+- `<setup>/lib/init-helpers.sh` — bash helper functions (logging, idempotent docker checks).
+- `<setup>/init.sh` — root initializer: prerequisites, the shared `cc-net` network, the `claude-auth` volume, the `cc-docker-proxy` container, building `cc-image`, PATH wiring in `~/.bashrc`, then iterating `<setup>/*/init.sh`.
 
-**Проектные настройки** (НЕ в setup-репозитории — локальные на каждой машине):
-- `<setup>/<project-name>/` — папка с настройками конкретного подключённого проекта. Парная к `<projects-root>/<project-name>/` (одно и то же имя).
+**Project settings** (NOT in the setup repo — local to each machine):
+- `<setup>/<project-name>/` — settings folder for a specific connected project. Paired with `<projects-root>/<project-name>/` (same name).
 
-Корневой `init.sh` итерируется по `<setup>/*/init.sh`. Папка идентифицируется по наличию `init.sh` внутри. Папки без `init.sh` (`bin/`, `lib/`, `cc-docker-proxy/`) пропускаются молча.
+The root `init.sh` iterates `<setup>/*/init.sh`. A folder is identified by the presence of `init.sh` inside it. Folders without `init.sh` (`bin/`, `lib/`, `cc-docker-proxy/`) are skipped silently.
 
-## Соглашения
+## Conventions
 
-- Имя `<setup>/<project-name>/` ОБЯЗАНО совпадать с именем `<projects-root>/<project-name>/`. По имени папки в setup'е находится связанный проект.
-- Образ проекта (если требуется расширение `cc-image`): `cc-image-<project-name>`.
-- Сервисные контейнеры проекта: `cc-<project-name>-<service>` (например `cc-expro-vpn`).
-- Образы сервисных контейнеров: `cc-<project-name>-<service>-image`.
+- The name `<setup>/<project-name>/` MUST match the name of `<projects-root>/<project-name>/`. The setup folder name is how the linked project gets located.
+- Project image (if `cc-image` needs extending): `cc-image-<project-name>`.
+- Project service containers: `cc-<project-name>-<service>` (e.g. `cc-expro-vpn`).
+- Service container images: `cc-<project-name>-<service>-image`.
 
-## Входные данные
+## Inputs
 
-Запросить у пользователя:
-1. `<project-name>` — имя проектной папки (должно совпадать с папкой в `<projects-root>`).
-2. Подтверждение, что `<projects-root>/<project-name>/` существует и готов (репозиторий клонирован, зависимости установлены).
+Ask the user for:
+1. `<project-name>` — the project folder name (must match the folder in `<projects-root>`).
+2. Confirmation that `<projects-root>/<project-name>/` exists and is ready (repo cloned, dependencies installed).
 
-## Шаг 1. Анализ проекта
+## Step 1. Analyze the project
 
-Прочитать `<projects-root>/<project-name>/` и выяснить, что нужно проектному init.sh.
+Read `<projects-root>/<project-name>/` and figure out what the project init.sh needs.
 
-### 1.1. Compose-сети
+### 1.1. Compose networks
 ```bash
 find <projects-root>/<project-name> -maxdepth 4 -name 'docker-compose*.y*ml' \
     -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/vendor/*'
 ```
-Прочитать каждый файл, извлечь имена сетей (секция `networks:`). Compose обычно даёт сетям имя `<stack-folder>_<network>` (если `name:` не задано явно). Зафиксировать список — это будущий `COMPOSE_NETWORKS` массив в `ccd-config.sh`.
+Read each file, extract network names (the `networks:` section). Compose typically names networks `<stack-folder>_<network>` (unless `name:` is set explicitly). Record the list — this becomes the `COMPOSE_NETWORKS` array in `ccd-config.sh`.
 
-### 1.2. Host-bound скрипты
+### 1.2. Host-bound scripts
 ```bash
 find <projects-root>/<project-name> -maxdepth 3 -name '*.sh' \
     -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/vendor/*'
 ```
-Прочитать каждый. Признаки host-bound:
-- `127.0.0.1` или `localhost` для DB/сервисов;
-- `./vpn-on.sh`, `./vpn-off.sh`, прочие host-only утилиты;
-- абсолютные пути на `/home/<user>/...` или `/etc/...`;
-- предполагается запуск с хоста, не из контейнера.
+Read each one. Signs of a host-bound script:
+- `127.0.0.1` or `localhost` for DB/services;
+- `./vpn-on.sh`, `./vpn-off.sh`, other host-only utilities;
+- absolute paths into `/home/<user>/...` or `/etc/...`;
+- assumes execution from the host, not from a container.
 
-Каждый такой скрипт — кандидат на адаптацию (Шаг 6).
+Each such script is a candidate for adaptation (Step 6).
 
-### 1.3. VPN/туннель к удалённой инфре
-Если в скриптах или конфигах есть упоминание внешнего хоста через `127.0.0.1:<port>` (типичный признак SSH-туннеля или socat-релея на хосте), а реальный хост недоступен напрямую из контейнерной сети — **нужен сервисный VPN-контейнер** в общей сети `cc-net`. Имя контейнера: `cc-<project-name>-vpn`. Типичная реализация — xray + socat внутри сервисного контейнера. Готовые шаблоны: `<setup>/lib/project-template/Dockerfile.vpn` и `<setup>/lib/project-template/vpn-entrypoint.sh` — копируются в `<setup>/<project-name>/` без изменений; кастомизация под проект — только через `vpn-config/config.json` (xray-конфиг с реальным upstream) и переменные `DB_REMOTE_HOST`/`DB_REMOTE_PORT` в `docker create` из проектного `init.sh`. Скелет init.sh, собирающий такой контейнер, — `<setup>/lib/project-template/init.sh`.
+### 1.3. VPN/tunnel to remote infrastructure
+If scripts or configs reference an external host via `127.0.0.1:<port>` (the typical sign of an SSH tunnel or socat relay on the host), and the real host is not directly reachable from the container network — **a service VPN container is needed** in the shared `cc-net` network. Container name: `cc-<project-name>-vpn`. Typical implementation: xray + socat inside the service container. Templates: `<setup>/lib/project-template/Dockerfile.vpn` and `<setup>/lib/project-template/vpn-entrypoint.sh` — copied into `<setup>/<project-name>/` unchanged; project-specific customization goes only into `vpn-config/config.json` (xray config with the real upstream) and the `DB_REMOTE_HOST`/`DB_REMOTE_PORT` variables in the `docker create` call inside the project init.sh. The skeleton init.sh that builds such a container is `<setup>/lib/project-template/init.sh`.
 
-### 1.4. Системные требования
-Что использует проект, чего нет в базовом `cc-image`:
-- Playwright/Cypress — браузерные либы + Chromium;
-- `psql`, `mysql`, `mongo` клиенты;
+### 1.4. System requirements
+What the project uses that is not in the base `cc-image`:
+- Playwright/Cypress — browser libs + Chromium;
+- `psql`, `mysql`, `mongo` clients;
 - `nc`, `redis-cli`, `kubectl`, `aws` CLI;
-- runtime'ы (php, python, ruby, go) — если нужно гонять CLI проекта внутри CC-контейнера.
+- runtimes (php, python, ruby, go) — if you need to run the project's CLI inside the CC container.
 
-Если что-то нужно сверх `cc-image` — отдельный `<setup>/<project-name>/Dockerfile` (FROM cc-image). Шаблон с закомментированными примерами расширений (postgres-client, Playwright и т.п.) — `<setup>/lib/project-template/Dockerfile`.
+Anything beyond `cc-image` → a separate `<setup>/<project-name>/Dockerfile` (FROM cc-image). A template with commented-out extension examples (postgres-client, Playwright, etc.) is at `<setup>/lib/project-template/Dockerfile`.
 
-### 1.5. Источники секретов на хосте
-- `.env`-файлы в проекте;
-- backup'ы в `temp-backup/` (если делалась миграция);
-- ENV-переменные пользователя.
+### 1.5. Sources of secrets on the host
+- `.env` files in the project;
+- backups in `temp-backup/` (if a migration was done);
+- the user's ENV variables.
 
-Каждый источник — спросить у пользователя для подтверждения.
+For each source — confirm with the user.
 
-## Шаг 2. Решения по архитектуре (согласовать с пользователем)
+## Step 2. Architecture decisions (agree with the user)
 
-На основе Шага 1 — задать пользователю отдельные вопросы:
+Based on Step 1, ask the user separate questions:
 
-| Решение | Когда нужно |
+| Decision | When needed |
 |---|---|
-| `<setup>/<project-name>/Dockerfile` (cc-image-<project-name>) | Шаг 1.4 нашёл нестандартные требования |
-| Сервисный контейнер (Dockerfile.<svc> + entrypoint + конфиг) | Шаг 1.3 нашёл VPN/туннель ИЛИ проекту нужен dedicated сервис |
-| Непустой `COMPOSE_NETWORKS` | Шаг 1.1 нашёл compose-сети, к которым CC должен подключаться |
-| Адаптация скриптов в `.claude/scripts/` | Шаг 1.2 нашёл host-bound скрипты, которые должны работать из CC-контейнера |
-| Файл `<projects-root>/<project-name>/.claude/<name>-credentials.env` | У проекта есть пароли/ключи, которые нужны скриптам |
+| `<setup>/<project-name>/Dockerfile` (cc-image-<project-name>) | Step 1.4 found non-default requirements |
+| Service container (Dockerfile.<svc> + entrypoint + config) | Step 1.3 found a VPN/tunnel OR the project needs a dedicated service |
+| Non-empty `COMPOSE_NETWORKS` | Step 1.1 found compose networks CC must attach to |
+| Adapt scripts in `.claude/scripts/` | Step 1.2 found host-bound scripts that should run from the CC container |
+| `<projects-root>/<project-name>/.claude/<name>-credentials.env` | The project has passwords/keys the scripts need |
 
-Если ничего сверх базового не нужно — `<setup>/<project-name>/` содержит только минимальный `init.sh`, который генерирует `ccd-config.sh` (с пустым `COMPOSE_NETWORKS=()` и пустым `VPN_CONTAINER`).
+If nothing beyond the base is needed, `<setup>/<project-name>/` only contains a minimal `init.sh` that generates `ccd-config.sh` (with empty `COMPOSE_NETWORKS=()` and empty `VPN_CONTAINER`).
 
-**Не действовать слепо**: на каждом решении явно показать пользователю, что нашёл в Шаге 1, что предлагаешь делать, и дождаться подтверждения.
+**Do not act blindly**: at every decision, explicitly show the user what you found in Step 1, what you propose to do, and wait for confirmation.
 
-## Шаг 3. Создать структуру папок
+## Step 3. Create the folder structure
 
-В `<setup>/<project-name>/`:
+Inside `<setup>/<project-name>/`:
 ```
-init.sh                         # обязательный
-ccd-config.sh                   # генерирует init.sh; конфиг обвязки лежит в setup-репо, а не в bind-mount проекта — иначе CC из сессии мог бы менять свои же EXPOSE_GIT_*-флаги
-mcp.json                        # генерирует init.sh пустым; project-level MCP-серверы. Источник правды — здесь, не <projects-root>/.../.mcp.json (read-only bind-mount + --strict-mcp-config в ccd → анти-tampering)
-[Dockerfile]                    # опциональный
-[Dockerfile.<svc>]              # опциональный
-[<svc>-entrypoint.sh]           # опциональный
-[<svc>-config/]                 # опциональный (секреты внутри)
-```
-
-В `<projects-root>/<project-name>/.claude/`:
-```
-[<name>-credentials.env]        # генерирует init.sh, chmod 600
-[scripts/]                      # адаптированные скрипты, если есть
+init.sh                         # required
+ccd-config.sh                   # generated by init.sh; the wrapper config lives in the setup repo, not in the project bind-mount — otherwise CC from a session could rewrite its own EXPOSE_GIT_* flags
+mcp.json                        # generated empty by init.sh; project-level MCP servers. Source of truth lives here, not in <projects-root>/.../.mcp.json (read-only bind-mount + --strict-mcp-config in ccd → anti-tampering)
+[Dockerfile]                    # optional
+[Dockerfile.<svc>]              # optional
+[<svc>-entrypoint.sh]           # optional
+[<svc>-config/]                 # optional (secrets inside)
 ```
 
-`<setup>/<project-name>/` целиком исключена из setup-репозитория whitelist'ом — секреты внутри в безопасности.
+Inside `<projects-root>/<project-name>/.claude/`:
+```
+[<name>-credentials.env]        # generated by init.sh, chmod 600
+[scripts/]                      # adapted scripts, if any
+```
 
-`<projects-root>/<project-name>/` — отдельный репозиторий проекта (если это git-репо). В этом случае его `.gitignore` обязан игнорировать `db-credentials.env` (или другое имя `*-credentials.env`) и любые `*.env`. Проектный init.sh при генерации credentials-файла **обязан вывести предупреждение** об этом. Если проект — не git-репо, правило неприменимо, секреты в `.claude/` локальные по дизайну.
+`<setup>/<project-name>/` is excluded from the setup repo whitelist as a whole — secrets inside are safe.
 
-## Шаг 4. Реализовать `<setup>/<project-name>/init.sh`
+`<projects-root>/<project-name>/` is a separate project repo (if it is a git repo). In that case its `.gitignore` MUST ignore `db-credentials.env` (or whatever `*-credentials.env` you use) and any `*.env`. The project init.sh, when generating the credentials file, **MUST emit a warning** about this. If the project is not a git repo, the rule does not apply — secrets in `.claude/` are local by design.
 
-Полный рабочий пример с VPN-контейнером — `<setup>/lib/project-template/init.sh`. Имя проекта в шаблоне — `expro` (example project); при адаптации заменить `expro` на `<project-name>`, переменные `EXPRO_*` → `<PROJECT_NAME>_*`, скорректировать `COMPOSE_NETWORKS` и `DB_REMOTE_HOST`, удалить блоки VPN/credentials, если они проекту не нужны. Соседние файлы шаблона (`Dockerfile`, `Dockerfile.vpn`, `vpn-entrypoint.sh`, `mcp.json`) копируются в `<setup>/<project-name>/` по необходимости — см. Шаг 3.
+## Step 4. Implement `<setup>/<project-name>/init.sh`
 
-Минимальный скелет (без VPN, без проектного Dockerfile, без credentials):
+A full working example with a VPN container is `<setup>/lib/project-template/init.sh`. The project name in the template is `expro` (example project); when adapting, replace `expro` with `<project-name>`, `EXPRO_*` variables with `<PROJECT_NAME>_*`, adjust `COMPOSE_NETWORKS` and `DB_REMOTE_HOST`, drop the VPN/credentials blocks if the project does not need them. The template's neighboring files (`Dockerfile`, `Dockerfile.vpn`, `vpn-entrypoint.sh`, `mcp.json`) are copied into `<setup>/<project-name>/` as needed — see Step 3.
+
+Minimal skeleton (no VPN, no project Dockerfile, no credentials):
 
 ```bash
 #!/bin/bash
@@ -141,124 +141,124 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# 1. Валидация: PROJECT_DIR должен существовать
-[ -d "$PROJECT_DIR" ] || cc_die "проект $PROJECT_DIR не найден"
-cc_log_skip "проект найден: $PROJECT_DIR"
+# 1. Validation: PROJECT_DIR must exist
+[ -d "$PROJECT_DIR" ] || cc_die "project $PROJECT_DIR not found"
+cc_log_skip "project found: $PROJECT_DIR"
 
-# 2. Копирование секретов в <setup>/<project-name>/<svc>-config/ (если требуется)
-# 3. Сборка cc-image-<project-name> (если есть Dockerfile, FROM cc-image)
-# 4. Сборка cc-<project-name>-<svc>-image (если есть Dockerfile.<svc>, может быть FROM любая база)
-# 5. Генерация <name>-credentials.env (chmod 600) — если файла нет, иначе SKIP
-# 6. Генерация ccd-config.sh — если файла нет, иначе SKIP с проверкой на отсутствующие поля
-# 7. Генерация mcp.json (пустой `{"mcpServers": {}}`) — если файла нет, иначе SKIP
-# 8. Создание сервисных контейнеров (`docker create` без run, идемпотентно через rm -f + create)
+# 2. Copy secrets into <setup>/<project-name>/<svc>-config/ (if needed)
+# 3. Build cc-image-<project-name> (if a Dockerfile exists, FROM cc-image)
+# 4. Build cc-<project-name>-<svc>-image (if a Dockerfile.<svc> exists, may be FROM any base)
+# 5. Generate <name>-credentials.env (chmod 600) — only if the file is missing, otherwise SKIP
+# 6. Generate ccd-config.sh — only if the file is missing, otherwise SKIP with a missing-fields check
+# 7. Generate mcp.json (empty `{"mcpServers": {}}`) — only if the file is missing, otherwise SKIP
+# 8. Create service containers (`docker create` without run, idempotent via rm -f + create)
 
 cc_log_ok "$PROJECT_NAME/init.sh: ok"
 ```
 
-### Идемпотентность
-Каждый ресурс — `inspect → SKIP / create`. Никаких безусловных действий, ломающих существующее состояние.
+### Idempotency
+Every resource — `inspect → SKIP / create`. No unconditional actions that would clobber existing state.
 
-### Не перезаписывать существующие конфиги
-`ccd-config.sh` и `<name>-credentials.env` пишутся ТОЛЬКО при отсутствии. Если файл есть — сравнить набор обязательных ключей с шаблоном внутри init.sh; при несовпадении — `cc_log_info` с диагностикой, пользователь обновляет вручную.
+### Do not overwrite existing configs
+`ccd-config.sh` and `<name>-credentials.env` are written ONLY when missing. If the file exists, compare its set of required keys against the template inside init.sh; on mismatch, emit `cc_log_info` with diagnostics and the user updates by hand.
 
-### Каскад флагов
-- `--rebuild` → пересобрать ВСЕ образы проекта (включая сервисные с другой базой). Сервисные контейнеры пересоздать.
-- `--rebuild-base-derived` (передаёт корневой init.sh при расхождении UID/GID `cc-image`) → пересобрать ТОЛЬКО образы с `FROM cc-image`. Сервисные с другой базой (`debian:bookworm-slim` и т.п.) НЕ трогать. Сервисные контейнеры тоже не пересоздавать (их образ не менялся).
+### Flag cascade
+- `--rebuild` → rebuild ALL project images (including service containers based on a different image). Re-create service containers.
+- `--rebuild-base-derived` (forwarded by the root init.sh on a `cc-image` UID/GID drift) → rebuild ONLY images that are `FROM cc-image`. Service images on a different base (`debian:bookworm-slim`, etc.) are NOT touched. Service containers are also not re-created (their image did not change).
 
-### Источники секретов — явные ветки, не магия
-Для каждого секрета: явный список приоритетов источников (ENV-переменные → .env-файл проекта → backup → fail с инструкцией). Каждый источник — отдельная ветка в коде.
+### Secret sources — explicit branches, no magic
+For each secret: an explicit list of source priorities (ENV variables → project `.env` file → backup → fail with instructions). Each source is its own code branch.
 
-## Шаг 5. Сгенерировать `ccd-config.sh`
+## Step 5. Generate `ccd-config.sh`
 
-Шаблон (init.sh пишет это в `<setup>/<project-name>/ccd-config.sh`, chmod 644 — путь в setup-репо, не в проектной папке: bind-mount проекта в cc-сессии read-write, и если бы конфиг был там, CC мог бы переписать `EXPOSE_GIT_*` своими руками):
+Template (init.sh writes this into `<setup>/<project-name>/ccd-config.sh`, chmod 644 — path is in the setup repo, not in the project folder: the project bind-mount in the CC session is read-write, and if the config lived there CC could rewrite `EXPOSE_GIT_*` itself):
 
 ```bash
-IMAGE=cc-image-<project-name>          # или cc-image, если без своего Dockerfile
+IMAGE=cc-image-<project-name>          # or cc-image, if no project Dockerfile
 CONTAINER_NAME_PREFIX=cc-<project-name>
-COMPOSE_NETWORKS=("net1" "net2")        # из Шага 1.1; пустой массив (), если не нужны
-VPN_CONTAINER=cc-<project-name>-vpn     # пустая строка "", если VPN не нужен
+COMPOSE_NETWORKS=("net1" "net2")        # from Step 1.1; empty array () if none needed
+VPN_CONTAINER=cc-<project-name>-vpn     # empty string "", if VPN not needed
 VPN_REFCOUNT_FILE="$PROJECT_DIR/.claude/cc-<project-name>-vpn.users"
-EXPOSE_GIT_IDENTITY=1   # CC коммитит от имени пользователя (sanitized bind-mount ~/.gitconfig в /home/claude/.gitconfig:ro)
-EXPOSE_GIT_PUSH=0       # =1 — CC пушит через $SSH_AUTH_SOCK (доступ ко всем репо в ssh-agent!)
-EXPOSE_GITCONFIG=0      # =1 — bind-mount ~/.gitconfig целиком, без sanitization (signingkey, credential.helper, url-rewrites)
+EXPOSE_GIT_IDENTITY=1   # CC commits as the user (sanitized bind-mount of ~/.gitconfig into /home/claude/.gitconfig:ro)
+EXPOSE_GIT_PUSH=0       # =1 — CC pushes via $SSH_AUTH_SOCK (access to every repo in ssh-agent!)
+EXPOSE_GITCONFIG=0      # =1 — bind-mount ~/.gitconfig as-is, no sanitization (signingkey, credential.helper, url-rewrites)
 ```
 
-`$PROJECT_DIR` устанавливается обёрткой `bin/ccd` ДО `source` конфига — внутри шаблона это литерал `$PROJECT_DIR`, не expand при создании.
+`$PROJECT_DIR` is set by the `bin/ccd` wrapper BEFORE it sources the config — inside the template this is the literal `$PROJECT_DIR`, not expanded at creation time.
 
-`COMPOSE_NETWORKS` обязан быть **bash-массивом**, не строкой — обёртка `ccd` итерируется через `"${COMPOSE_NETWORKS[@]}"`. Пустой массив `()` = не подключаться ни к каким compose-сетям.
+`COMPOSE_NETWORKS` MUST be a **bash array**, not a string — the `ccd` wrapper iterates with `"${COMPOSE_NETWORKS[@]}"`. Empty array `()` = no compose networks attached.
 
-`VPN_CONTAINER=""` (пустая строка) = VPN-логика отключена; обёртка не делает refcount-операций.
+`VPN_CONTAINER=""` (empty string) = VPN logic disabled; the wrapper does not perform any refcount operations.
 
-Полная reference-таблица всех переменных `ccd-config.sh` (включая базовые: `IMAGE`, `COMPOSE_NETWORKS`, `VPN_CONTAINER` и т.д.) — в `<setup>/README.md`, раздел «Конфигурация проектного `ccd-config.sh`». Default'ы из шаблона: `IDENTITY=1, PUSH=0, GITCONFIG=0` — CC коммитит локально, ревью и push делает пользователь.
+The full reference table for every `ccd-config.sh` variable (including base ones: `IMAGE`, `COMPOSE_NETWORKS`, `VPN_CONTAINER`, etc.) is in `<setup>/README.md`, section "Project `ccd-config.sh` configuration". Template defaults: `IDENTITY=1, PUSH=0, GITCONFIG=0` — CC commits locally, the user reviews and pushes.
 
-## Шаг 6. Адаптировать host-bound скрипты проекта (если нашёл в Шаге 1.2)
+## Step 6. Adapt the project's host-bound scripts (if any from Step 1.2)
 
-Для каждого скрипта:
-1. Backup в `<projects-root>/<project-name>/temp-backup/<original-path>` (с сохранением структуры).
-2. Перенести в `<projects-root>/<project-name>/.claude/scripts/<name>.sh`.
-3. Заменить:
-   - `127.0.0.1`/`localhost` для прокси к удалённому хосту → DNS сервисного контейнера (`cc-<project-name>-vpn` и т.п.) — резолвится по сети `cc-net`.
-   - Хостовые абсолютные пути → пути внутри контейнера или относительные.
-   - Загрузка секретов: вместо хардкода — `source "$(dirname "$(realpath "$0")")/../<name>-credentials.env"`.
-   - Защита от мутаций (для DB-скриптов): grep на forbidden операции (INSERT/UPDATE/DROP/...).
-4. **НЕ управлять жизненным циклом сервисных контейнеров** — это делает `bin/ccd` через trap+refcount. Скрипт делает только `docker start <vpn>` (идемпотентно, на случай первого вызова) + `nc -z` ожидание готовности.
+For each script:
+1. Back up to `<projects-root>/<project-name>/temp-backup/<original-path>` (preserving structure).
+2. Move to `<projects-root>/<project-name>/.claude/scripts/<name>.sh`.
+3. Replace:
+   - `127.0.0.1`/`localhost` for the proxy to a remote host → DNS of the service container (`cc-<project-name>-vpn`, etc.) — resolves over the `cc-net` network.
+   - Absolute host paths → paths inside the container, or relative paths.
+   - Secret loading: instead of hardcoding — `source "$(dirname "$(realpath "$0")")/../<name>-credentials.env"`.
+   - Mutation guards (for DB scripts): grep for forbidden operations (INSERT/UPDATE/DROP/...).
+4. **Do NOT manage service container lifecycle** — that is `bin/ccd`'s job via trap+refcount. The script only does `docker start <vpn>` (idempotent, in case of the first call) + `nc -z` readiness wait.
 5. `chmod 755`.
-6. Обновить документацию проекта (CLAUDE.md, README.md и т.п.) — заменить старые пути и инструкции на `.claude/scripts/<name>.sh`.
+6. Update project documentation (CLAUDE.md, README.md, etc.) — replace old paths and instructions with `.claude/scripts/<name>.sh`.
 
-Backup оригиналов в `temp-backup/` обязателен ДО изменения.
+Backing up originals to `temp-backup/` is mandatory BEFORE any change.
 
-## Шаг 7. Запуск init.sh
+## Step 7. Run init.sh
 
 ```bash
 bash <setup>/<project-name>/init.sh
 ```
-или через корневой:
+or via the root one:
 ```bash
 bash <setup>/init.sh --project <project-name>
 ```
 
-Ожидаемое: образы созданы, сервисные контейнеры в `Created`, `ccd-config.sh` и `<name>-credentials.env` сгенерированы.
+Expected: images created, service containers in `Created`, `ccd-config.sh` and `<name>-credentials.env` generated.
 
-## Шаг 8. Верификация
+## Step 8. Verification
 
 ```bash
 cd <projects-root>/<project-name> && ccd
 ```
 
-Внутри сессии CC:
+Inside the CC session:
 - `pwd` → `<projects-root>/<project-name>`.
-- `id` → `claude:claude` с UID/GID хоста.
-- Compose-сервисы доступны: `nc -zv <service-hostname> <port>` для каждой сети из `COMPOSE_NETWORKS`.
-- Адаптированные скрипты работают (конкретная проверка зависит от проекта; например, тестовый SELECT через адаптированный db-query.sh).
-- `/exit` — контейнер `cc-<project-name>-<pid>` удалён по `--rm`. Сервисные контейнеры остановлены, если refcount пуст.
+- `id` → `claude:claude` with the host UID/GID.
+- Compose services reachable: `nc -zv <service-hostname> <port>` for every network in `COMPOSE_NETWORKS`.
+- Adapted scripts work (the actual check is project-specific; e.g. a test SELECT through an adapted db-query.sh).
+- `/exit` — the `cc-<project-name>-<pid>` container is removed by `--rm`. Service containers are stopped if refcount is empty.
 
-После верификации — подключение завершено. На новой машине этот же проект разворачивается копированием `<setup>/<project-name>/` + запуском корневого `init.sh`.
+After verification, the connection is complete. On a new machine the same project is brought up by copying `<setup>/<project-name>/` and running the root `init.sh`.
 
-## Тонкости
+## Edge cases
 
-- При коллизии имён сервисов между проектами — соглашение `cc-<project-name>-<service>` гарантирует изоляцию. НЕ переиспользовать чужие сервисные контейнеры.
-- Если проектный init.sh упал — корневой `init.sh` не блокируется, итерируется дальше. Финальная сводка покажет `[FAIL] проект <name>`. exit code корневого станет non-zero.
-- Все секреты (xray-config, db-credentials и любые проектные) генерируются ТОЛЬКО при отсутствии файла. Перезапись — никогда (см. «Не перезаписывать» в Шаге 4). Шаблон-источник истины — внутри проектного init.sh; при изменении полей старые файлы обновляются вручную после диагностики.
-- `<setup>/<project-name>/` целиком исключена из setup-репозитория. На новую машину переносится копированием либо подключается с нуля по этому ТЗ.
-- OAuth Claude Code — отдельный однократный шаг **после** первого `ccd`-запуска: `claude-cc-bin` volume прогревается обёрткой `ccd` автоматически, при первом старте CC внутри контейнера инициирует OAuth-flow.
+- On service-name collisions across projects, the `cc-<project-name>-<service>` convention guarantees isolation. Do NOT reuse service containers from other projects.
+- If a project init.sh fails, the root `init.sh` is not blocked — it iterates onward. The final summary will show `[FAIL] project <name>`. The root's exit code becomes non-zero.
+- All secrets (xray-config, db-credentials, anything project-specific) are generated ONLY when the file is missing. Never overwritten (see "Do not overwrite" in Step 4). The template (source of truth) lives inside the project init.sh; on field changes, old files are updated by hand after diagnostics.
+- `<setup>/<project-name>/` as a whole is excluded from the setup repo. Moving to a new machine — copy it, or connect from scratch using this spec.
+- Claude Code OAuth is a separate one-time step **after** the first `ccd` run: the `claude-cc-bin` volume is warmed up by the `ccd` wrapper automatically; on the first start, CC inside the container initiates the OAuth flow.
 
-## Референс
+## Reference
 
-`<setup>/lib/project-template/` — обезличенная папка-эталон проектной директории. Имя проекта в шаблоне — `expro` (example project). Содержимое:
+`<setup>/lib/project-template/` — an anonymized reference project folder. The project name in the template is `expro` (example project). Contents:
 
-| Файл | Назначение |
+| File | Purpose |
 |---|---|
-| `init.sh` | полный пример проектного init.sh: образ `cc-image-expro` (FROM `cc-image`), сервисный `cc-expro-vpn-image` (FROM `debian:bookworm-slim`), копирование xray-конфига в `vpn-config/` (chmod 600), генерация `db-credentials.env` и `ccd-config.sh` без перезаписи, `docker create` для `cc-expro-vpn`, каскад флагов `--rebuild` / `--rebuild-base-derived` |
-| `Dockerfile` | минимальный `FROM cc-image` с закомментированными примерами расширений (postgres-client, Playwright). Удалить, если проекту достаточно базового `cc-image` |
-| `Dockerfile.vpn` | сервисный xray + socat. Копируется в проект без изменений; вся специфика — в `vpn-config/config.json` + ENV `DB_REMOTE_HOST`/`DB_REMOTE_PORT` |
-| `vpn-entrypoint.sh` | entrypoint VPN-контейнера. Копируется без изменений |
-| `mcp.json` | пустой `{"mcpServers": {}}`. Заполняется руками или генерируется проектным init.sh |
+| `init.sh` | full project init.sh example: image `cc-image-expro` (FROM `cc-image`), service `cc-expro-vpn-image` (FROM `debian:bookworm-slim`), copying xray config to `vpn-config/` (chmod 600), generation of `db-credentials.env` and `ccd-config.sh` without overwriting, `docker create` for `cc-expro-vpn`, the flag cascade `--rebuild` / `--rebuild-base-derived` |
+| `Dockerfile` | minimal `FROM cc-image` with commented-out extension examples (postgres-client, Playwright). Drop it if the base `cc-image` is enough for the project |
+| `Dockerfile.vpn` | service xray + socat. Copied into the project unchanged; all specifics live in `vpn-config/config.json` + `DB_REMOTE_HOST`/`DB_REMOTE_PORT` env vars |
+| `vpn-entrypoint.sh` | VPN container entrypoint. Copied unchanged |
+| `mcp.json` | empty `{"mcpServers": {}}`. Filled in by hand or generated by the project init.sh |
 
-Прочитать `init.sh` целиком — самый быстрый способ понять структуру. Адаптация: скопировать всю папку (или нужные файлы) в `<setup>/<project-name>/`, заменить `expro` → `<project-name>` (в т.ч. ENV-префикс `EXPRO_*`), скорректировать `COMPOSE_NETWORKS` и `DB_REMOTE_HOST`, удалить блоки VPN/credentials, если они не нужны.
+Reading `init.sh` end-to-end is the fastest way to grasp the layout. Adaptation: copy the whole folder (or the files you need) into `<setup>/<project-name>/`, replace `expro` → `<project-name>` (including the `EXPRO_*` env prefix), adjust `COMPOSE_NETWORKS` and `DB_REMOTE_HOST`, drop the VPN/credentials blocks if not needed.
 
-`vpn-config/config.json` шаблон НЕ содержит — это секрет. Два рабочих пути:
-1. **Источник истины — в проекте**: положить `xray-config.json` в `<projects-root>/<project-name>/xray-config.json` (так делает шаблон `init.sh`, секция 2). При первом запуске `init.sh` скопирует его в `<setup>/<project-name>/vpn-config/config.json` (chmod 600). Удобно, если xray-конфиг уже в репо проекта (с правильным `.gitignore`!) или у пользователя на руках.
-2. **Источник истины — в setup-папке**: положить `config.json` сразу в `<setup>/<project-name>/vpn-config/config.json` руками (chmod 600). `init.sh` увидит файл и пропустит копирование. Удобно, если хочется держать секрет полностью вне репо проекта.
+`vpn-config/config.json` is NOT in the template — it's a secret. Two working paths:
+1. **Source of truth in the project**: drop `xray-config.json` into `<projects-root>/<project-name>/xray-config.json` (this is what the template `init.sh` does, section 2). On the first run, `init.sh` will copy it into `<setup>/<project-name>/vpn-config/config.json` (chmod 600). Convenient if the xray config is already in the project repo (with proper `.gitignore`!) or in the user's hands.
+2. **Source of truth in the setup folder**: drop `config.json` straight into `<setup>/<project-name>/vpn-config/config.json` by hand (chmod 600). `init.sh` will see the file and skip the copy. Convenient if you want the secret entirely outside the project repo.
 
-В обоих случаях после первого запуска `init.sh` истиной становится `<setup>/<project-name>/vpn-config/config.json` (он же монтируется в VPN-контейнер read-only). Ротация — правка этого файла + `docker restart cc-<project-name>-vpn`.
+In both cases, after the first `init.sh` run, `<setup>/<project-name>/vpn-config/config.json` is the source of truth (and the same file is mounted read-only into the VPN container). Rotation: edit this file + `docker restart cc-<project-name>-vpn`.

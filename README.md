@@ -1,178 +1,178 @@
 # Claude Code Docker
 
-Обёртка для запуска [Claude Code](https://docs.anthropic.com/en/docs/claude-code) в Docker-контейнерах, изолированных по проектам. Один OAuth-токен на хост, отдельный контейнер на каждую сессию, прозрачная интеграция с проектными compose-сетями и сервисными контейнерами (VPN, прокси и т.п.).
+A wrapper that runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) inside per-project Docker containers. One OAuth token per host, a separate container per session, transparent integration with project compose networks and service containers (VPN, proxies, etc.).
 
-Тестировалось на **Ubuntu 22.04+**. Хостовый `claude` не обязателен — `ccd` запускает изолированный экземпляр CC из docker-volume `claude-cc-bin`.
-
----
-
-## Зачем
-
-- **`--dangerously-skip-permissions` без риска.** CC работает без подтверждений `Bash`/`Edit`/`Write`; защита держится не на prompt'ах, а на изоляции уровня контейнера: docker API через прокси с whitelist'ом, `--cap-drop=ALL` + `no-new-privileges`, sanitized git-identity, нет доступа к `~/.ssh/`, `~/.aws/`, `~/.bashrc` хоста.
-- **Один контейнер — один проект.** Bind-mount только своей папки.
-- **Подключение к compose-сетям.** Внутри сессии видны `db`, `redis` и т.п. по compose-именам.
-- **Общий OAuth-токен.** OAuth — один раз, в volume `claude-auth`, переиспользуется всеми проектами.
-- **Идемпотентный bootstrap.** `init.sh` можно перезапускать сколько угодно — повторный прогон ничего не пересобирает.
+Tested on **Ubuntu 22.04+**. A host-side `claude` binary is not required — `ccd` runs an isolated CC instance from the `claude-cc-bin` docker volume.
 
 ---
 
-## Архитектура
+## Why
+
+- **`--dangerously-skip-permissions` without the risk.** CC runs without `Bash`/`Edit`/`Write` confirmations; protection is enforced at the container layer rather than via prompts: docker API through a whitelisted proxy, `--cap-drop=ALL` + `no-new-privileges`, sanitized git identity, no access to the host's `~/.ssh/`, `~/.aws/`, or `~/.bashrc`.
+- **One container, one project.** Bind-mounts only the current project directory.
+- **Compose-network attach.** Inside a session, `db`, `redis`, etc. are visible by their compose names.
+- **Shared OAuth token.** One-time OAuth, stored in the `claude-auth` volume, reused across projects.
+- **Idempotent bootstrap.** `init.sh` can be re-run safely — a repeat run rebuilds nothing.
+
+---
+
+## Architecture
 
 ```
-<setup>/                                    setup-репозиторий
+<setup>/                                    setup repository
 ├── Dockerfile, init.sh, connect-project.md
-├── bin/ccd                                 обёртка-запускалка
-├── cc-docker-proxy/haproxy.cfg             whitelist docker API
-├── lib/init-helpers.sh, project-template/  helpers + шаблон проекта
-└── <project-name>/                         настройки проекта (НЕ в репо)
-    ├── init.sh                             проектный инициализатор
-    ├── ccd-config.sh                       сгенерируется (вне bind-mount проекта — анти-tampering)
+├── bin/ccd                                 launcher wrapper
+├── cc-docker-proxy/haproxy.cfg             docker API whitelist
+├── lib/init-helpers.sh, project-template/  helpers + project template
+└── <project-name>/                         per-project settings (NOT in repo)
+    ├── init.sh                             project initializer
+    ├── ccd-config.sh                       generated (outside the project bind-mount — anti-tampering)
     ├── mcp.json                            project-level MCP
-    ├── Dockerfile (опц.) FROM cc-image
-    └── Dockerfile.<svc> + <svc>-config/ (опц.) сервисные контейнеры
+    ├── Dockerfile (opt.) FROM cc-image
+    └── Dockerfile.<svc> + <svc>-config/ (opt.) service containers
 
-<projects-root>/<project-name>/             код проекта (отдельный репо)
+<projects-root>/<project-name>/             project source (separate repo)
 └── .claude/{<name>-credentials.env, scripts/}
 ```
 
-| Ресурс | Назначение |
+| Resource | Purpose |
 |---|---|
-| `cc-image` | базовый образ (FROM `node:22-slim` + git/curl/jq/rg/docker-cli) |
-| `cc-image-<project>` | (опц.) проектное расширение |
-| `cc-net` | docker-сеть для сервисных контейнеров |
-| `cc-docker-proxy` | прокси docker.sock с whitelist'ом |
-| `claude-auth` (volume) | OAuth-токен, общий |
-| `claude-cc-bin` (volume) | бинарь Claude Code, прогревается `ccd` |
-| `cc-<project>-<pid>` | временный контейнер на сессию (`--rm`) |
-| `cc-<project>-<svc>` | сервисный контейнер (refcount управляет `ccd`) |
+| `cc-image` | base image (FROM `node:22-slim` + git/curl/jq/rg/docker-cli) |
+| `cc-image-<project>` | (opt.) per-project extension |
+| `cc-net` | docker network for service containers |
+| `cc-docker-proxy` | docker.sock proxy with whitelist |
+| `claude-auth` (volume) | shared OAuth token |
+| `claude-cc-bin` (volume) | Claude Code binary, warmed up by `ccd` |
+| `cc-<project>-<pid>` | ephemeral per-session container (`--rm`) |
+| `cc-<project>-<svc>` | service container (refcount-managed by `ccd`) |
 
 ---
 
-## Требования
+## Requirements
 
 - Linux (Ubuntu 22.04 / 24.04).
-- Docker Engine 20.10+ с плагином Docker Compose v2.
+- Docker Engine 20.10+ with the Docker Compose v2 plugin.
 - `jq`, `flock` (`util-linux`), `realpath` (`coreutils`).
-- Пользователь в группе `docker`.
+- User in the `docker` group.
 
-`init.sh` сам проверяет утилиты и падает с подсказкой при отсутствии.
+`init.sh` checks for these utilities itself and fails with a hint if any are missing.
 
 ---
 
-## Установка
+## Installation
 
 ```bash
-cd ~/projects   # либо другой <projects-root>
+cd ~/projects   # or any other <projects-root>
 git clone <repo-url> claude-code-docker
 bash claude-code-docker/init.sh
-source ~/.bashrc   # для нового PATH
+source ~/.bashrc   # to pick up the new PATH
 ```
 
-`init.sh` создаёт `cc-net`/`claude-auth`/`cc-docker-proxy`, собирает `cc-image` под UID/GID хоста, дописывает `<setup>/bin` в PATH, запускает `<setup>/*/init.sh` для подключённых проектов.
+`init.sh` creates `cc-net`/`claude-auth`/`cc-docker-proxy`, builds `cc-image` against the host UID/GID, appends `<setup>/bin` to PATH, and runs `<setup>/*/init.sh` for connected projects.
 
-**Авторизация Claude Code (один раз):**
+**Claude Code authorization (one-time):**
 
 ```bash
-cd <projects-root>/<любой-проект>
+cd <projects-root>/<any-project>
 ccd
 ```
 
-Первый запуск прогревает `claude-cc-bin` (~30 сек), CC внутри инициирует OAuth-flow. Если auto-prompt не сработал — внутри сессии `/login`. Токен живёт в `claude-auth` для всех проектов.
+The first run warms up `claude-cc-bin` (~30 sec) and CC initiates the OAuth flow inside the session. If auto-prompt does not fire, run `/login` inside the session. The token lives in `claude-auth` and is shared across all projects.
 
 ---
 
-## Использование
+## Usage
 
 ```bash
 cd <projects-root>/<project-name>
-ccd                       # интерактивная CC-сессия
-ccd -- <claude-flag>      # передача флагов в claude CLI
+ccd                       # interactive CC session
+ccd -- <claude-flag>      # pass flags through to the claude CLI
 ```
 
-`ccd` walks вверх от `$PWD` до предка с `<setup>/<basename>/ccd-config.sh`, читает конфиг, стартует сервисные контейнеры под refcount, запускает CC-контейнер с bind-mount проекта и compose-сетями. На выходе — `--rm` + cleanup сервисных по refcount.
+`ccd` walks up from `$PWD` to the ancestor that has `<setup>/<basename>/ccd-config.sh`, reads the config, starts service containers under refcount, then launches the CC container with the project bind-mount and compose networks attached. On exit — `--rm` plus refcount-driven service-container cleanup.
 
 ---
 
-## Подключение нового проекта
+## Connecting a new project
 
-`connect-project.md` — ТЗ для агента Claude (запускать в нативном `claude` на хосте). Если нативного нет — пройти руками, отталкиваясь от `lib/project-template/`.
+`connect-project.md` is the spec for a Claude agent (run it in the native host-side `claude`). If no native CC is available, follow it manually using `lib/project-template/`.
 
-**Краткая последовательность:**
+**Short version:**
 
-1. Создать пару `<setup>/<name>/` + `<projects-root>/<name>/` (одинаковое имя).
-2. Скопировать нужные файлы из `lib/project-template/` в `<setup>/<name>/`, заменить `expro` → `<name>`.
+1. Create a paired `<setup>/<name>/` + `<projects-root>/<name>/` (same name).
+2. Copy the needed files from `lib/project-template/` into `<setup>/<name>/`, replacing `expro` → `<name>`.
 3. `bash <setup>/init.sh --project <name>`.
-4. `cd <projects-root>/<name> && ccd` — внутри сессии должны быть видны проектные сервисы.
+4. `cd <projects-root>/<name> && ccd` — project services should be visible inside the session.
 
-`<setup>/<project-name>/` исключена whitelist'ом из setup-репозитория — содержит секреты.
+`<setup>/<project-name>/` is excluded from the setup repo by the whitelist — it contains secrets.
 
 ---
 
-## Идемпотентность и пересборка
+## Idempotency and rebuilds
 
-`init.sh` идемпотентен — `inspect → SKIP / create` для каждого ресурса.
+`init.sh` is idempotent — `inspect → SKIP / create` for every resource.
 
-| Флаг | Действие |
+| Flag | Effect |
 |---|---|
-| `--rebuild` | пересобрать ВСЕ образы (общие + проектные + сервисные) |
-| `--skip-projects` | только общие шаги |
-| `--project <name>` | только указанный проектный init.sh |
+| `--rebuild` | rebuild ALL images (shared + per-project + service) |
+| `--skip-projects` | only the shared steps |
+| `--project <name>` | only the named project's init.sh |
 
-При расхождении UID/GID хоста с `cc-image` корневой `init.sh` пересобирает `cc-image` и передаёт `--rebuild-base-derived` проектным — пересобираются только производные `FROM cc-image`.
+If the host UID/GID drifts from `cc-image`, the root `init.sh` rebuilds `cc-image` and forwards `--rebuild-base-derived` to project initializers — only `FROM cc-image` derivatives get rebuilt.
 
 ---
 
-## Конфигурация проектного `ccd-config.sh`
+## Project `ccd-config.sh` configuration
 
-Bash-файл с переменными для обёртки `ccd`. Лежит в `<setup>/<project>/`, **не** в bind-mount'е проекта — иначе CC изнутри сессии мог бы переписать `EXPOSE_GIT_PUSH=0` → `1`. Изменения подхватываются новой сессией.
+A bash file with variables for the `ccd` wrapper. Lives in `<setup>/<project>/`, **not** in the project bind-mount — otherwise CC inside the session could rewrite `EXPOSE_GIT_PUSH=0` → `1`. Changes are picked up by the next session.
 
-### Базовые переменные
+### Base variables
 
-| Переменная | Тип | Назначение |
+| Variable | Type | Purpose |
 |---|---|---|
-| `IMAGE` | string | Образ CC-контейнера: `cc-image-<project>` или `cc-image`. |
-| `CONTAINER_NAME_PREFIX` | string | Префикс имён CC-контейнеров (финальное — `<prefix>-<pid>`). |
-| `COMPOSE_NETWORKS` | bash array | Список compose-сетей. Пустой `()` — без подключения. |
-| `VPN_CONTAINER` | string | Имя VPN-контейнера. `""` — VPN не используется. |
-| `VPN_REFCOUNT_FILE` | path | Файл refcount активных сессий, держащих VPN. |
+| `IMAGE` | string | CC container image: `cc-image-<project>` or `cc-image`. |
+| `CONTAINER_NAME_PREFIX` | string | CC container name prefix (final name is `<prefix>-<pid>`). |
+| `COMPOSE_NETWORKS` | bash array | List of compose networks. Empty `()` — no attach. |
+| `VPN_CONTAINER` | string | VPN container name. `""` — no VPN. |
+| `VPN_REFCOUNT_FILE` | path | Refcount file for active sessions holding the VPN open. |
 
-### Защита от git-RCE
+### Git-RCE protection
 
-| Переменная | Default | Что делает | Что ломает |
+| Variable | Default | What it does | What it breaks |
 |---|---|---|---|
-| `LOCK_GIT_INTERNALS` | `1` | bind-mount `.git/hooks` и `.git/config` всех `.git`-директорий проекта (`maxdepth 4`) как `:ro`. CC не может писать вредоносный hook или per-repo `[alias] !cmd`/`[core] sshCommand`/`[filter "X"]`. | `git config --local`, `pre-commit install`/`husky install` изнутри сессии. |
-| `LOCK_GITMODULES` | `0` | bind-mount `.gitmodules` как `:ro`. CC не может подменить URL подмодуля. | `git submodule add` изнутри сессии. |
+| `LOCK_GIT_INTERNALS` | `1` | Bind-mounts `.git/hooks` and `.git/config` for every `.git` directory in the project (`maxdepth 4`) as `:ro`. CC cannot write a malicious hook or per-repo `[alias] !cmd`/`[core] sshCommand`/`[filter "X"]`. | `git config --local`, `pre-commit install`/`husky install` from inside the session. |
+| `LOCK_GITMODULES` | `0` | Bind-mounts `.gitmodules` as `:ro`. CC cannot swap submodule URLs. | `git submodule add` from inside the session. |
 
-Audit (всегда): sha256-snapshot `.git/hooks/*`, `.git/config`, `.gitattributes`, `.gitmodules` фиксируется при старте, сравнивается на cleanup; расхождение → stderr WARNING.
+Audit (always on): a sha256 snapshot of `.git/hooks/*`, `.git/config`, `.gitattributes`, `.gitmodules` is taken at session start and compared on cleanup; any drift goes to stderr as a WARNING.
 
-Что **не** закрывается флагами: локальные мутации истории (`rebase`, `reset --hard`, `commit --amend`, `filter-branch`) — это легитимное использование git. Митигация — `git fetch` + `git log -p` в чистом remote перед push.
+What flags do **not** close: local history mutations (`rebase`, `reset --hard`, `commit --amend`, `filter-branch`) — that is legitimate git use. Mitigation: `git fetch` + `git log -p` against a clean remote before pushing.
 
-### Git-доступ (опт-ин)
+### Git access (opt-in)
 
-| Переменная | Default | Что пробрасывается | Риск |
+| Variable | Default | What's exposed | Risk |
 |---|---|---|---|
-| `EXPOSE_GIT_IDENTITY` | `1` | sanitized `~/.gitconfig` + `[includeIf]`-includes как `:ro` — `git commit` с нормальным cascade | минимальный |
-| `EXPOSE_GIT_PUSH` | `0` | `$SSH_AUTH_SOCK` — `git push` через ВСЕ ключи в ssh-agent | средний |
-| `EXPOSE_GITCONFIG` | `0` | raw `~/.gitconfig` без sanitize — `signingkey`, `credential.helper`, `[url]`-rewrites | высокий |
+| `EXPOSE_GIT_IDENTITY` | `1` | sanitized `~/.gitconfig` + `[includeIf]` includes as `:ro` — `git commit` works with normal cascade | minimal |
+| `EXPOSE_GIT_PUSH` | `0` | `$SSH_AUTH_SOCK` — `git push` via every key in ssh-agent | medium |
+| `EXPOSE_GITCONFIG` | `0` | raw `~/.gitconfig` without sanitization — `signingkey`, `credential.helper`, `[url]` rewrites | high |
 
-При `EXPOSE_GIT_IDENTITY=1` из global gitconfig вырезаются: `[credential]`, `[gpg]`, `[http]`, `[https]`, все `[url "..."]`, `*.signingkey`, `core.sshCommand`/`askpass`/`hooksPath`, `commit.gpgsign`/`tag.gpgsign`. Сохраняются: `user.name`, `user.email`, `pull.*`, `merge.*`, `rebase.*`, `alias.*`, `[includeIf]`.
+When `EXPOSE_GIT_IDENTITY=1`, the global gitconfig has the following stripped: `[credential]`, `[gpg]`, `[http]`, `[https]`, all `[url "..."]`, `*.signingkey`, `core.sshCommand`/`askpass`/`hooksPath`, `commit.gpgsign`/`tag.gpgsign`. Preserved: `user.name`, `user.email`, `pull.*`, `merge.*`, `rebase.*`, `alias.*`, `[includeIf]`.
 
-| Сценарий | `IDENTITY` | `PUSH` | `GITCONFIG` | Когда |
+| Scenario | `IDENTITY` | `PUSH` | `GITCONFIG` | When |
 |---|---|---|---|---|
-| Read-only анализ | `0` | `0` | `0` | Чужой код, untrusted PR. |
-| **CC коммитит, юзер пушит** | `1` | `0` | `0` | **Default из шаблона.** |
-| Полная свобода | `1` | `1` | `0` | Доверенный личный проект. |
-| Особый gitconfig | — | — | `1` | GPG-signed commits, кастомные `[url]`-rewrites. |
+| Read-only analysis | `0` | `0` | `0` | Third-party code, untrusted PR. |
+| **CC commits, user pushes** | `1` | `0` | `0` | **Default from the template.** |
+| Full freedom | `1` | `1` | `0` | Trusted personal project. |
+| Custom gitconfig | — | — | `1` | GPG-signed commits, custom `[url]` rewrites. |
 
-Незаданный `EXPOSE_*` = `0` (fail-secure). Незаданный `LOCK_GIT_INTERNALS` = `1` (fail-secure).
+Unset `EXPOSE_*` = `0` (fail-secure). Unset `LOCK_GIT_INTERNALS` = `1` (fail-secure).
 
-XDG-альтернатива (`~/.config/git/config`) **не поддерживается** — `bin/ccd` читает только `~/.gitconfig`. Мигрируйте либо настройте per-repo через `git config --local`.
+The XDG alternative (`~/.config/git/config`) is **not supported** — `bin/ccd` reads only `~/.gitconfig`. Either migrate, or configure per-repo via `git config --local`.
 
 ---
 
-## MCP-серверы
+## MCP servers
 
-Project-MCP конфиг — `<setup>/<project>/mcp.json` (вне bind-mount'а — анти-tampering). `ccd` запускает `claude --mcp-config <path> --strict-mcp-config`: остальные источники (`.mcp.json` в проекте, `~/.claude.json` `projects[].mcpServers`) игнорируются.
+Project-level MCP config is `<setup>/<project>/mcp.json` (outside the bind-mount — anti-tampering). `ccd` runs `claude --mcp-config <path> --strict-mcp-config`: every other source (`.mcp.json` in the project, `~/.claude.json` `projects[].mcpServers`) is ignored.
 
 ```json
 {
@@ -186,52 +186,52 @@ Project-MCP конфиг — `<setup>/<project>/mcp.json` (вне bind-mount'а 
 }
 ```
 
-IDE-MCP (PhpStorm и т.п.) подключается отдельно — через bind-mount IDE-lock-файла + `CLAUDE_CODE_SSE_PORT`.
+IDE-MCP (PhpStorm, etc.) is wired up separately — via an IDE lock-file bind-mount + `CLAUDE_CODE_SSE_PORT`.
 
 ---
 
-## Безопасность
+## Security
 
-CC работает с `--dangerously-skip-permissions`. Изоляция:
+CC runs with `--dangerously-skip-permissions`. Isolation:
 
-1. **Прокси docker.sock** (`tecnativa/docker-socket-proxy` + custom `haproxy.cfg`). Разрешено: `containers/exec`/`start`/`stop`/`inspect`, `networks/inspect`. Запрещено: `containers/create` (explicit deny в `haproxy.cfg`), `build`, `images/pull`, `volumes/*`. Атакующий не может создать `--privileged` контейнер.
+1. **docker.sock proxy** (`tecnativa/docker-socket-proxy` + custom `haproxy.cfg`). Allowed: `containers/exec`/`start`/`stop`/`inspect`, `networks/inspect`. Denied: `containers/create` (explicit deny in `haproxy.cfg`), `build`, `images/pull`, `volumes/*`. An attacker cannot spawn a `--privileged` container.
 2. **`--cap-drop=ALL`** + `--security-opt=no-new-privileges`.
-3. **Опт-ин git-доступ** через `EXPOSE_GIT_*` (default `1/0/0`).
-4. **`LOCK_GIT_INTERNALS=1`** (default) — `.git/hooks/*` и per-repo `.git/config` смонтированы `:ro`, git-RCE векторы закрыты.
+3. **Opt-in git access** via `EXPOSE_GIT_*` (default `1/0/0`).
+4. **`LOCK_GIT_INTERNALS=1`** (default) — `.git/hooks/*` and per-repo `.git/config` mounted `:ro`, git-RCE vectors closed.
 
-**Что атакующий через prompt injection может:**
-- Изменить файлы проекта (откатываемо через git).
-- Прочитать OAuth-token из `claude-auth` и отправить наружу (`claude /logout` + повторная авторизация).
-- `docker compose exec` в compose-контейнер проекта — команда с правами того контейнера, **не** хоста.
-- Дойти до соседних compose-стеков через подключённые сети.
+**What an attacker via prompt injection CAN do:**
+- Modify project files (revertible via git).
+- Read the OAuth token from `claude-auth` and exfiltrate it (`claude /logout` + re-authorize).
+- `docker compose exec` into a project compose container — runs with that container's privileges, **not** the host's.
+- Reach neighboring compose stacks via attached networks.
 
-**НЕ может:**
-- Прочитать `~/.ssh/`, `~/.aws/`, `~/.config/` хоста.
-- Изменить `~/.bashrc`/`authorized_keys`/cron.
-- Эскалировать до root через docker.sock.
-- Записать вредоносный `.git/hooks/<name>` или `[alias] !cmd`/`[core] sshCommand` в per-repo `.git/config` (при `LOCK_GIT_INTERNALS=1`).
+**CANNOT:**
+- Read the host's `~/.ssh/`, `~/.aws/`, or `~/.config/`.
+- Modify `~/.bashrc`/`authorized_keys`/cron.
+- Escalate to root via docker.sock.
+- Plant a malicious `.git/hooks/<name>` or `[alias] !cmd`/`[core] sshCommand` in per-repo `.git/config` (when `LOCK_GIT_INTERNALS=1`).
 
-**Когда модель ломается:**
-- `EXPOSE_GIT_PUSH=1` или `EXPOSE_GITCONFIG=1` — агент получает ssh-agent / raw gitconfig.
-- `LOCK_GIT_INTERNALS=0` — открываются git-RCE векторы (`.git/hooks/`, per-repo `[alias]`/`sshCommand`/`[filter]`).
-- `-v /var/run/docker.sock:...` в проектном Dockerfile или публикация TCP-порта прокси (`-p 2375:2375`).
+**When the model breaks:**
+- `EXPOSE_GIT_PUSH=1` or `EXPOSE_GITCONFIG=1` — the agent gets ssh-agent / raw gitconfig.
+- `LOCK_GIT_INTERNALS=0` — git-RCE vectors reopen (`.git/hooks/`, per-repo `[alias]`/`sshCommand`/`[filter]`).
+- `-v /var/run/docker.sock:...` in a project Dockerfile, or publishing the proxy on a TCP port (`-p 2375:2375`).
 
-Для **полной** изоляции от compose-контейнеров проекта (untrusted код) — отдельная VM либо rootless Docker.
+For **full** isolation from project compose containers (untrusted code) — use a separate VM or rootless Docker.
 
 ---
 
 ## Troubleshooting
 
-| Симптом | Решение |
+| Symptom | Fix |
 |---|---|
-| `[FAIL] не найден 'docker'` | установите Docker Engine, в группу `docker`, перезайдите. |
-| `[FAIL] не работает 'docker compose'` | `apt install docker-compose-plugin`. |
-| Файлы как `nobody:nogroup` после `ccd` | UID/GID не совпадает — `bash init.sh` пересоберёт `cc-image`. |
-| OAuth-flow не стартует | внутри сессии `/login`. |
-| `cc-<project>-vpn` не стартует | `docker logs cc-<project>-vpn`, проверить `<setup>/<project>/vpn-config/`. |
+| `[FAIL] 'docker' not found` | install Docker Engine, add yourself to the `docker` group, log back in. |
+| `[FAIL] 'docker compose' not working` | `apt install docker-compose-plugin`. |
+| Files owned by `nobody:nogroup` after `ccd` | UID/GID mismatch — `bash init.sh` will rebuild `cc-image`. |
+| OAuth flow does not start | run `/login` inside the session. |
+| `cc-<project>-vpn` does not start | `docker logs cc-<project>-vpn`, inspect `<setup>/<project>/vpn-config/`. |
 
 ---
 
-## Лицензия
+## License
 
-См. `LICENSE` либо обратитесь к владельцу репозитория.
+See `LICENSE` or contact the repository owner.

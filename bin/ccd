@@ -1,11 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
-# 1. walk-up до проектной папки. ccd-config.sh лежит в setup-репо
-# (<setup>/<project>/ccd-config.sh), а не в bind-mount'е проекта —
-# иначе CC из своей же сессии мог бы повысить себе привилегии правкой
-# EXPOSE_GIT_PUSH/EXPOSE_GITCONFIG. Маркер проекта — совпадение
-# basename(PWD-ancestor) с папкой в <setup>/, у которой есть ccd-config.sh.
+# 1. Walk up to the project folder. ccd-config.sh lives in the setup repo
+# (<setup>/<project>/ccd-config.sh), not in the project bind-mount —
+# otherwise CC from its own session could escalate by editing
+# EXPOSE_GIT_PUSH/EXPOSE_GITCONFIG. Project marker: basename(PWD-ancestor)
+# matches a folder in <setup>/ that has a ccd-config.sh.
 SETUP_DIR="$(realpath "$(dirname "${BASH_SOURCE[0]}")/..")"
 PROJECT_DIR="$(pwd)"
 PROJECT_NAME=""
@@ -18,11 +18,11 @@ while [ "$PROJECT_DIR" != "/" ]; do
     PROJECT_DIR="$(dirname "$PROJECT_DIR")"
 done
 if [ -z "$PROJECT_NAME" ]; then
-    echo "ccd: project not found for $(pwd) — нет ccd-config.sh ни для одного предка в $SETUP_DIR/<name>/" >&2
+    echo "ccd: project not found for $(pwd) — no ccd-config.sh for any ancestor under $SETUP_DIR/<name>/" >&2
     exit 1
 fi
 
-# 2. подгрузить проектные параметры
+# 2. Load project parameters
 COMPOSE_NETWORKS=()
 VPN_CONTAINER=""
 VPN_REFCOUNT_FILE=""
@@ -118,7 +118,7 @@ prune_refcount() {
     mv "$tmp" "$VPN_REFCOUNT_FILE"
 }
 
-# 3. опциональные пробрасывания git/ssh — три гранулярных опт-ин-флага
+# 3. Optional git/ssh pass-through — three granular opt-in flags
 EXTRA_FLAGS=()
 SANITIZED_GITCONFIGS=()
 
@@ -189,7 +189,7 @@ if [ "${EXPOSE_GIT_IDENTITY:-0}" = "1" ]; then
     fi
 
     if [ -f "$HOME/.config/git/config" ]; then
-        echo "ccd: WARNING — обнаружен ~/.config/git/config (XDG); не поддерживается, identity из него не подхватится. Перенесите ключи в ~/.gitconfig либо настройте git config --local в каждом репо." >&2
+        echo "ccd: WARNING — detected ~/.config/git/config (XDG); not supported, identity from it will not be picked up. Migrate keys into ~/.gitconfig or use git config --local in each repo." >&2
     fi
 fi
 
@@ -202,13 +202,13 @@ if [ "${EXPOSE_GITCONFIG:-0}" = "1" ] && [ -f "$HOME/.gitconfig" ]; then
     EXTRA_FLAGS+=( -v "$HOME/.gitconfig:$CONTAINER_HOME/.gitconfig:ro" )
 fi
 
-# 3.4 защита от git-RCE векторов: hooks, per-repo config, .gitmodules.
-# Bind-mount поверх основного rw-маунта проекта как :ro — CC физически не
-# может писать в .git/hooks/ или редактировать .git/config (alias с !cmd,
-# core.sshCommand, [filter "X"] для .gitattributes). Это закрывает RCE
-# на хосте при последующем `git commit/checkout/fetch` пользователя.
-# maxdepth 4 ловит корневой .git и типичные monorepo-вложения; submodule
-# pointer-файлы (.git как файл) пропускаются find'ом по `-type d`/`-type f`.
+# 3.4 Guard against git-RCE vectors: hooks, per-repo config, .gitmodules.
+# Bind-mount on top of the main rw project mount as :ro — CC physically
+# cannot write to .git/hooks/ or edit .git/config (alias with !cmd,
+# core.sshCommand, [filter "X"] for .gitattributes). This closes the RCE
+# vector on the host on a subsequent user-side `git commit/checkout/fetch`.
+# maxdepth 4 catches the root .git and typical monorepo nestings; submodule
+# pointer files (.git as a file) are skipped by find via `-type d`/`-type f`.
 GIT_AUDIT_SNAPSHOT=""
 if [ "${LOCK_GIT_INTERNALS:-1}" = "1" ]; then
     while IFS= read -r -d '' git_dir; do
@@ -222,9 +222,9 @@ if [ "${LOCK_GITMODULES:-0}" = "1" ]; then
     done < <(find "$PROJECT_DIR" -maxdepth 4 -name '.gitmodules' -type f -print0 2>/dev/null)
 fi
 
-# Audit-snapshot: всегда фиксируем состояние git-чувствительных файлов до
-# старта; cleanup сравнит и логирует расхождения. Это ОБНАРУЖЕНИЕ, не защита,
-# работает даже при LOCK_GIT_INTERNALS=0 / LOCK_GITMODULES=0.
+# Audit snapshot: always record the state of git-sensitive files before
+# start; cleanup will compare and log any drift. This is DETECTION, not
+# protection, and works even with LOCK_GIT_INTERNALS=0 / LOCK_GITMODULES=0.
 GIT_AUDIT_SNAPSHOT=$(mktemp /tmp/ccd-git-audit.XXXXXX)
 {
     find "$PROJECT_DIR" -maxdepth 4 -type f \( \
@@ -236,11 +236,11 @@ GIT_AUDIT_SNAPSHOT=$(mktemp /tmp/ccd-git-audit.XXXXXX)
     | xargs -0 -r sha256sum 2>/dev/null
 } > "$GIT_AUDIT_SNAPSHOT" 2>/dev/null || true
 
-# 3.5 проектные MCP-серверы. Источник правды — <setup>/<project>/mcp.json
-# (вне bind-mount проекта, CC из сессии править не может). Read-only монтаж
-# плюс --strict-mcp-config: игнорируются ВСЕ остальные источники
-# (.mcp.json в проекте, ~/.claude.json projects[].mcpServers и т.д.) —
-# атакующий через prompt-injection не может подсунуть свой MCP.
+# 3.5 Project-level MCP servers. Source of truth — <setup>/<project>/mcp.json
+# (outside the project bind-mount, CC cannot edit it from a session).
+# Read-only mount plus --strict-mcp-config: ALL other sources are ignored
+# (.mcp.json in the project, ~/.claude.json projects[].mcpServers, etc.) —
+# an attacker via prompt-injection cannot slip in their own MCP.
 PROJECT_MCP_HOST="$SETUP_DIR/$PROJECT_NAME/mcp.json"
 PROJECT_MCP_CONTAINER="$CONTAINER_HOME/.config/ccd/mcp.json"
 if [ -f "$PROJECT_MCP_HOST" ]; then
@@ -269,13 +269,13 @@ if [ -n "${CLAUDE_CODE_SSE_PORT:-}" ]; then
     fi
 fi
 
-# 4. глобальные скиллы
+# 4. Global skills
 if [ -d "$HOME/.claude/skills" ]; then
     EXTRA_FLAGS+=( -v "$HOME/.claude/skills:/home/claude/.claude/skills:ro" )
 fi
 
-# 5. проброс ~/.claude/ — монтировать только существующее:
-# несуществующий путь docker создаст как пустой dir под root.
+# 5. ~/.claude/ pass-through — mount only what exists:
+# a non-existent path would be created by docker as an empty dir owned by root.
 GLOBAL_CLAUDE_PATHS=(
     "$HOME/.claude/CLAUDE.md:/home/claude/.claude/CLAUDE.md"
     "$HOME/.claude/settings.json:/home/claude/.claude/settings.json"
@@ -293,11 +293,12 @@ for entry in "${GLOBAL_CLAUDE_PATHS[@]}"; do
     fi
 done
 
-# 6. cleanup-функция и trap СТАВЯТСЯ ДО docker run.
-# Ключ: cleanup идемпотентен на несуществующем контейнере (`docker stop ... 2>/dev/null || true`),
-# поэтому преждевременный фаер trap'а безопасен. Постановка trap ПОСЛЕ docker run -d оставляет
-# узкое окно: сигнал между завершением docker run и установкой trap → контейнер запущен, но
-# bash вышел без cleanup → утечка контейнера.
+# 6. Cleanup function and trap are INSTALLED BEFORE docker run.
+# Key point: cleanup is idempotent on a non-existent container
+# (`docker stop ... 2>/dev/null || true`), so an early trap fire is safe.
+# Setting the trap AFTER docker run -d would leave a narrow window: a signal
+# between docker run completing and the trap being set → the container is up
+# but bash exits without cleanup → container leak.
 cleanup() {
     docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
     [ -n "$IDE_LOCK_DIR" ] && rm -rf "$IDE_LOCK_DIR"
@@ -318,11 +319,11 @@ cleanup() {
                 | xargs -0 -r sha256sum 2>/dev/null
             } > "$after" 2>/dev/null || true
             if ! cmp -s "$GIT_AUDIT_SNAPSHOT" "$after"; then
-                echo "ccd: WARNING — git internals изменились во время сессии:" >&2
+                echo "ccd: WARNING — git internals changed during the session:" >&2
                 diff "$GIT_AUDIT_SNAPSHOT" "$after" 2>/dev/null \
                     | sed -n 's/^[<>] *[a-f0-9]\{64\}  /  /p' \
                     | sort -u >&2 || true
-                echo "ccd: проверьте .git/hooks/, .git/config, .gitattributes, .gitmodules перед хостовыми git-командами." >&2
+                echo "ccd: inspect .git/hooks/, .git/config, .gitattributes, .gitmodules before running host-side git commands." >&2
             fi
             rm -f "$after"
         fi
@@ -340,7 +341,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM HUP
 
-# 7. запуск контейнера
+# 7. Launch the container
 docker run -d --rm --name "$CONTAINER_NAME" \
     --hostname "$CONTAINER_NAME" \
     --entrypoint /bin/bash \
@@ -359,12 +360,12 @@ docker run -d --rm --name "$CONTAINER_NAME" \
     "$IMAGE" \
     -c "sleep infinity" >/dev/null
 
-# 8. подключить к compose-сетям. Берём высокий IP в подсети, а не дефолтный
-# «нижний свободный» от IPAM. Иначе cc-контейнер занимает .2/.3, и compose-
-# сервис, который через `ipv4_address:` резервирует себе фиксированный
-# нижний адрес, при следующем `up` валится с "Address already in use".
-# (Реальный случай: compose-файл проекта через `ipv4_address:` фиксирует
-# себе нижний адрес типа 172.20.0.2 — без сдвига cc-контейнер забирает его первым.)
+# 8. Attach to compose networks. We pick a high IP in the subnet rather
+# than IPAM's default "lowest free" address. Otherwise the cc-container
+# takes .2/.3, and a compose service that reserves a fixed low address
+# via `ipv4_address:` blows up on the next `up` with "Address already in use".
+# (Real case: a project compose file pins itself via `ipv4_address:` to
+# something like 172.20.0.2 — without the shift, the cc-container takes it first.)
 calc_high_ips() {
     local subnet="$1"
     local ip="${subnet%/*}"
@@ -413,7 +414,7 @@ for net in "${COMPOSE_NETWORKS[@]}"; do
     fi
 done
 
-# 9. регистрация в VPN refcount
+# 9. Register in VPN refcount
 if [ -n "$VPN_CONTAINER" ] && [ -n "$VPN_REFCOUNT_FILE" ]; then
     mkdir -p "$(dirname "$VPN_REFCOUNT_FILE")"
     touch "$VPN_REFCOUNT_FILE"
@@ -423,7 +424,7 @@ if [ -n "$VPN_CONTAINER" ] && [ -n "$VPN_REFCOUNT_FILE" ]; then
     ) 200>"${VPN_REFCOUNT_FILE}.lock"
 fi
 
-# 10. интерактив (БЕЗ exec! exec заменяет bash на docker exec и убивает trap'ы EXIT/HUP/INT/TERM).
+# 10. Interactive session (NO exec! exec would replace bash with docker exec and kill EXIT/HUP/INT/TERM traps).
 CLAUDE_ARGS=(--dangerously-skip-permissions)
 [ -n "${CLAUDE_CODE_SSE_PORT:-}" ] && CLAUDE_ARGS+=(--ide)
 [ -f "$PROJECT_MCP_HOST" ] && CLAUDE_ARGS+=(--mcp-config "$PROJECT_MCP_CONTAINER" --strict-mcp-config)

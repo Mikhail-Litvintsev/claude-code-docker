@@ -1,6 +1,6 @@
-# Setup-репозиторий хранит только общие артефакты для всех проектов.
-# Проектные подпапки — локально-добавляемые, не в git.
-# Whitelist: всё на верхнем уровне игнорируется, кроме явных исключений.
+# The setup repo only stores artifacts shared across all projects.
+# Per-project subfolders are added locally and are not in git.
+# Whitelist: everything at the top level is ignored except for the explicit allow-list below.
 
 /*
 !/.gitignore

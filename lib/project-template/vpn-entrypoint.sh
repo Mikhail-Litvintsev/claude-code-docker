@@ -1,8 +1,8 @@
 #!/bin/bash
-# Entrypoint сервисного VPN-контейнера: xray-клиент + socat-релей.
-# DB_REMOTE_HOST/DB_REMOTE_PORT — целевой адрес за прокси, передаётся через -e
-# в `docker create` из проектного init.sh. xray-config монтируется read-only
-# из <setup>/<project-name>/vpn-config/config.json.
+# Service VPN container entrypoint: xray client + socat relay.
+# DB_REMOTE_HOST/DB_REMOTE_PORT — target address behind the proxy, passed via -e
+# in `docker create` from the project init.sh. xray-config is mounted read-only
+# from <setup>/<project-name>/vpn-config/config.json.
 
 set -euo pipefail
 

@@ -26,8 +26,8 @@ cc_ensure_docker_network() {
         cc_log_skip "docker network $name"
     else
         docker network create "$name" >/dev/null \
-            || cc_die "не удалось создать docker network $name"
-        cc_log_ok "docker network $name создан"
+            || cc_die "failed to create docker network $name"
+        cc_log_ok "docker network $name created"
     fi
 }
 
@@ -37,8 +37,8 @@ cc_ensure_docker_volume() {
         cc_log_skip "docker volume $name"
     else
         docker volume create "$name" >/dev/null \
-            || cc_die "не удалось создать docker volume $name"
-        cc_log_ok "docker volume $name создан"
+            || cc_die "failed to create docker volume $name"
+        cc_log_ok "docker volume $name created"
     fi
 }
 
@@ -56,9 +56,9 @@ cc_container_running() {
 
 cc_check_command() {
     local cmd="$1"
-    local hint="${2:-без подсказки}"
+    local hint="${2:-no hint}"
     if ! command -v "$cmd" >/dev/null 2>&1; then
-        cc_die "не найден '$cmd' в PATH. Установка: $hint"
+        cc_die "'$cmd' not found in PATH. Install: $hint"
     fi
-    cc_log_skip "host: $cmd доступен"
+    cc_log_skip "host: $cmd available"
 }
