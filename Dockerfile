@@ -30,6 +30,7 @@ RUN mkdir -p /home/claude/.ssh \
     && chmod 644 /home/claude/.ssh/known_hosts
 
 RUN mkdir -p /home/claude/.claude && chown -R claude:claude /home/claude/.claude
+RUN mkdir -p /home/claude/.config/ccd && chown -R claude:claude /home/claude/.config
 
 ENV CLAUDE_CONFIG_DIR=/home/claude/.claude
 
