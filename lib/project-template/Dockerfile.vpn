@@ -1,0 +1,22 @@
+# Опциональный сервисный VPN-контейнер на xray + socat.
+# Используйте, если проекту нужно дотянуться до удалённой инфры (типичный случай:
+# DB за SSH-туннелем или Shadowsocks/VLESS-прокси). vpn-entrypoint.sh поднимает
+# xray в режиме SOCKS-клиента (из vpn-config/config.json) и пробрасывает один
+# TCP-порт через socat → SOCKS на удалённый $DB_REMOTE_HOST:$DB_REMOTE_PORT.
+#
+# Этот Dockerfile НЕ FROM cc-image: ему не нужны UID/GID хоста и инструменты CC,
+# поэтому корневой init.sh не пересобирает его при смене UID (--rebuild-base-derived).
+
+FROM debian:bookworm-slim
+ARG XRAY_VERSION=v25.10.15
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        socat curl unzip ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" -o /tmp/xray.zip \
+    && unzip -j /tmp/xray.zip xray -d /usr/local/bin/ \
+    && chmod +x /usr/local/bin/xray \
+    && rm /tmp/xray.zip
+COPY vpn-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+EXPOSE 15433
+ENTRYPOINT ["/entrypoint.sh"]

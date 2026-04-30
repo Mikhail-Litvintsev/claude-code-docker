@@ -1,0 +1,431 @@
+#!/bin/bash
+set -euo pipefail
+
+# 1. walk-up до проектной папки. ccd-config.sh лежит в setup-репо
+# (<setup>/<project>/ccd-config.sh), а не в bind-mount'е проекта —
+# иначе CC из своей же сессии мог бы повысить себе привилегии правкой
+# EXPOSE_GIT_PUSH/EXPOSE_GITCONFIG. Маркер проекта — совпадение
+# basename(PWD-ancestor) с папкой в <setup>/, у которой есть ccd-config.sh.
+SETUP_DIR="$(realpath "$(dirname "${BASH_SOURCE[0]}")/..")"
+PROJECT_DIR="$(pwd)"
+PROJECT_NAME=""
+while [ "$PROJECT_DIR" != "/" ]; do
+    candidate=$(basename "$PROJECT_DIR")
+    if [ -f "$SETUP_DIR/$candidate/ccd-config.sh" ]; then
+        PROJECT_NAME="$candidate"
+        break
+    fi
+    PROJECT_DIR="$(dirname "$PROJECT_DIR")"
+done
+if [ -z "$PROJECT_NAME" ]; then
+    echo "ccd: project not found for $(pwd) — нет ccd-config.sh ни для одного предка в $SETUP_DIR/<name>/" >&2
+    exit 1
+fi
+
+# 2. подгрузить проектные параметры
+COMPOSE_NETWORKS=()
+VPN_CONTAINER=""
+VPN_REFCOUNT_FILE=""
+# shellcheck source=/dev/null
+source "$SETUP_DIR/$PROJECT_NAME/ccd-config.sh"
+
+: "${IMAGE:?ccd-config.sh must define IMAGE}"
+: "${CONTAINER_NAME_PREFIX:?ccd-config.sh must define CONTAINER_NAME_PREFIX}"
+
+CC_VOLUME=claude-cc-bin
+CC_MOUNT=/opt/claude
+CC_THROTTLE_SECONDS="${CCD_CC_THROTTLE_SECONDS:-3600}"
+CC_LOCK=/tmp/ccd-cc-bootstrap.lock
+CC_LAST_CHECK="${XDG_CACHE_HOME:-$HOME/.cache}/ccd/cc-last-check"
+
+mkdir -p "$(dirname "$CC_LAST_CHECK")"
+
+ensure_cc_in_volume() {
+    docker volume inspect "$CC_VOLUME" >/dev/null 2>&1 || docker volume create "$CC_VOLUME" >/dev/null
+
+    local last_check=0
+    [ -f "$CC_LAST_CHECK" ] && last_check=$(stat -c '%Y' "$CC_LAST_CHECK")
+    local installed
+    installed=$(docker run --rm -e "CC_MOUNT=$CC_MOUNT" -v "$CC_VOLUME:$CC_MOUNT" "$IMAGE" \
+        bash -c '[ -x "$CC_MOUNT/bin/claude" ] && "$CC_MOUNT/bin/claude" --version 2>/dev/null | awk '"'"'{print $1}'"'"'' \
+        2>/dev/null || true)
+
+    if [ -n "$installed" ] && [ $(($(date +%s) - last_check)) -lt "$CC_THROTTLE_SECONDS" ]; then
+        return
+    fi
+
+    (
+        flock -x 200
+
+        local latest
+        latest=$(docker run --rm "$IMAGE" npm view --silent @anthropic-ai/claude-code version 2>/dev/null || true)
+        if [ -z "$latest" ]; then
+            if [ -n "$installed" ]; then
+                exit 0
+            fi
+            echo "ccd: failed to query npm registry for @anthropic-ai/claude-code (no internet?) and volume is empty" >&2
+            exit 1
+        fi
+
+        if [ "$installed" != "$latest" ]; then
+            echo "ccd: installing @anthropic-ai/claude-code@${latest} into volume ${CC_VOLUME} (was: ${installed:-empty})" >&2
+            docker run --rm --user 0 -v "$CC_VOLUME:$CC_MOUNT" "$IMAGE" \
+                bash -c "
+                    set -e
+                    NPM_CONFIG_PREFIX=$CC_MOUNT \
+                        npm install --no-audit --no-fund --loglevel=error -g @anthropic-ai/claude-code@${latest} >/dev/null
+                    chown -R $(id -u):$(id -g) $CC_MOUNT
+                    chmod -R a+rX $CC_MOUNT
+                "
+        fi
+        touch "$CC_LAST_CHECK"
+    ) 200>"$CC_LOCK"
+}
+
+ensure_cc_in_volume
+
+if ! docker network inspect cc-net >/dev/null 2>&1; then
+    echo "ccd: cc-net not found — run <setup>/init.sh first" >&2
+    exit 1
+fi
+if [ "$(docker inspect -f '{{.State.Status}}' cc-docker-proxy 2>/dev/null || echo missing)" != "running" ]; then
+    echo "ccd: cc-docker-proxy not running — run <setup>/init.sh first" >&2
+    exit 1
+fi
+
+CONTAINER_NAME="${CONTAINER_NAME_PREFIX}-$$"
+CONTAINER_HOME=/home/claude
+
+prune_refcount() {
+    local action="$1"
+    local tmp
+    tmp="$(mktemp -p "$(dirname "$VPN_REFCOUNT_FILE")")"
+    : > "$tmp"
+    if [ -f "$VPN_REFCOUNT_FILE" ]; then
+        while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            [ "$name" = "$CONTAINER_NAME" ] && continue
+            local running
+            running=$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || true)
+            if [ "$running" = "true" ]; then
+                echo "$name" >> "$tmp"
+            fi
+        done < "$VPN_REFCOUNT_FILE"
+    fi
+    if [ "$action" = "add" ]; then
+        echo "$CONTAINER_NAME" >> "$tmp"
+    fi
+    mv "$tmp" "$VPN_REFCOUNT_FILE"
+}
+
+# 3. опциональные пробрасывания git/ssh — три гранулярных опт-ин-флага
+EXTRA_FLAGS=()
+SANITIZED_GITCONFIGS=()
+
+sanitize_gitconfig() {
+    local src="$1"
+    local dst
+    dst="$(mktemp /tmp/ccd-gitconfig.XXXXXX)"
+    cp "$src" "$dst"
+
+    local section
+    for section in credential gpg http https; do
+        git config --file "$dst" --remove-section "$section" 2>/dev/null || true
+    done
+
+    local url_sect
+    while read -r url_sect; do
+        [ -z "$url_sect" ] && continue
+        git config --file "$dst" --remove-section "$url_sect" 2>/dev/null || true
+    done < <(git config --file "$dst" --get-regexp '^url\.' 2>/dev/null \
+             | awk '{print $1}' | sed -E 's/\.[^.]+$//' | sort -u)
+
+    local key
+    for key in core.sshCommand core.askpass core.hooksPath; do
+        git config --file "$dst" --unset "$key" 2>/dev/null || true
+    done
+
+    while read -r key; do
+        [ -z "$key" ] && continue
+        git config --file "$dst" --unset "$key" 2>/dev/null || true
+    done < <(git config --file "$dst" --name-only --get-regexp '\.signingkey$' 2>/dev/null)
+
+    git config --file "$dst" --unset commit.gpgsign 2>/dev/null || true
+    git config --file "$dst" --unset tag.gpgsign 2>/dev/null || true
+
+    echo "$dst"
+}
+
+if [ "${EXPOSE_GIT_IDENTITY:-0}" = "1" ]; then
+    if [ -f "$HOME/.gitconfig" ]; then
+        sanitized="$(sanitize_gitconfig "$HOME/.gitconfig")"
+        SANITIZED_GITCONFIGS+=("$sanitized")
+        EXTRA_FLAGS+=( -v "$sanitized:$CONTAINER_HOME/.gitconfig:ro" )
+
+        while read -r inc_path; do
+            [ -z "$inc_path" ] && continue
+            case "$inc_path" in
+                /*)   host_abs="$inc_path"
+                      cont_abs="$inc_path" ;;
+                ~/*)  host_abs="${inc_path/#\~\//$HOME/}"
+                      cont_abs="${inc_path/#\~\//$CONTAINER_HOME/}" ;;
+                ~*)   host_abs="${inc_path/#\~/$HOME}"
+                      cont_abs="${inc_path/#\~/$CONTAINER_HOME}" ;;
+                *)    host_abs="$HOME/$inc_path"
+                      cont_abs="$CONTAINER_HOME/$inc_path" ;;
+            esac
+            if [ -f "$host_abs" ]; then
+                sanitized_inc="$(sanitize_gitconfig "$host_abs")"
+                SANITIZED_GITCONFIGS+=("$sanitized_inc")
+                EXTRA_FLAGS+=( -v "$sanitized_inc:$cont_abs:ro" )
+            fi
+        done < <(
+            git config --file "$HOME/.gitconfig" --get-all 'include.path' 2>/dev/null
+            git config --file "$HOME/.gitconfig" --name-only --get-regexp '^includeIf\..+\.path$' 2>/dev/null \
+                | while read -r k; do
+                    git config --file "$HOME/.gitconfig" --get "$k" 2>/dev/null
+                  done
+        )
+    fi
+
+    if [ -f "$HOME/.config/git/config" ]; then
+        echo "ccd: WARNING — обнаружен ~/.config/git/config (XDG); не поддерживается, identity из него не подхватится. Перенесите ключи в ~/.gitconfig либо настройте git config --local в каждом репо." >&2
+    fi
+fi
+
+if [ "${EXPOSE_GIT_PUSH:-0}" = "1" ] \
+    && [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
+    EXTRA_FLAGS+=( -v "$SSH_AUTH_SOCK:/ssh-agent" -e "SSH_AUTH_SOCK=/ssh-agent" )
+fi
+
+if [ "${EXPOSE_GITCONFIG:-0}" = "1" ] && [ -f "$HOME/.gitconfig" ]; then
+    EXTRA_FLAGS+=( -v "$HOME/.gitconfig:$CONTAINER_HOME/.gitconfig:ro" )
+fi
+
+# 3.4 защита от git-RCE векторов: hooks, per-repo config, .gitmodules.
+# Bind-mount поверх основного rw-маунта проекта как :ro — CC физически не
+# может писать в .git/hooks/ или редактировать .git/config (alias с !cmd,
+# core.sshCommand, [filter "X"] для .gitattributes). Это закрывает RCE
+# на хосте при последующем `git commit/checkout/fetch` пользователя.
+# maxdepth 4 ловит корневой .git и типичные monorepo-вложения; submodule
+# pointer-файлы (.git как файл) пропускаются find'ом по `-type d`/`-type f`.
+GIT_AUDIT_SNAPSHOT=""
+if [ "${LOCK_GIT_INTERNALS:-1}" = "1" ]; then
+    while IFS= read -r -d '' git_dir; do
+        [ -d "$git_dir/hooks" ]   && EXTRA_FLAGS+=( -v "$git_dir/hooks:$git_dir/hooks:ro" )
+        [ -f "$git_dir/config" ]  && EXTRA_FLAGS+=( -v "$git_dir/config:$git_dir/config:ro" )
+    done < <(find "$PROJECT_DIR" -maxdepth 4 -name '.git' -type d -print0 2>/dev/null)
+fi
+if [ "${LOCK_GITMODULES:-0}" = "1" ]; then
+    while IFS= read -r -d '' gm; do
+        EXTRA_FLAGS+=( -v "$gm:$gm:ro" )
+    done < <(find "$PROJECT_DIR" -maxdepth 4 -name '.gitmodules' -type f -print0 2>/dev/null)
+fi
+
+# Audit-snapshot: всегда фиксируем состояние git-чувствительных файлов до
+# старта; cleanup сравнит и логирует расхождения. Это ОБНАРУЖЕНИЕ, не защита,
+# работает даже при LOCK_GIT_INTERNALS=0 / LOCK_GITMODULES=0.
+GIT_AUDIT_SNAPSHOT=$(mktemp /tmp/ccd-git-audit.XXXXXX)
+{
+    find "$PROJECT_DIR" -maxdepth 4 -type f \( \
+        -path '*/.git/hooks/*' -o \
+        -path '*/.git/config' -o \
+        -name '.gitattributes' -o \
+        -name '.gitmodules' \
+    \) -print0 2>/dev/null \
+    | xargs -0 -r sha256sum 2>/dev/null
+} > "$GIT_AUDIT_SNAPSHOT" 2>/dev/null || true
+
+# 3.5 проектные MCP-серверы. Источник правды — <setup>/<project>/mcp.json
+# (вне bind-mount проекта, CC из сессии править не может). Read-only монтаж
+# плюс --strict-mcp-config: игнорируются ВСЕ остальные источники
+# (.mcp.json в проекте, ~/.claude.json projects[].mcpServers и т.д.) —
+# атакующий через prompt-injection не может подсунуть свой MCP.
+PROJECT_MCP_HOST="$SETUP_DIR/$PROJECT_NAME/mcp.json"
+PROJECT_MCP_CONTAINER="$CONTAINER_HOME/.config/ccd/mcp.json"
+if [ -f "$PROJECT_MCP_HOST" ]; then
+    EXTRA_FLAGS+=( -v "$PROJECT_MCP_HOST:$PROJECT_MCP_CONTAINER:ro" )
+fi
+
+IDE_LOCK_DIR=""
+if [ -n "${CLAUDE_CODE_SSE_PORT:-}" ]; then
+    HOST_IDE_LOCK="$HOME/.claude/ide/${CLAUDE_CODE_SSE_PORT}.lock"
+    if [ -f "$HOST_IDE_LOCK" ]; then
+        IDE_LOCK_DIR="$(mktemp -d -t "ccd-ide-${CLAUDE_CODE_SSE_PORT}.XXXXXX")"
+        jq 'del(.pid) | .useWebSocket = (.transport == "ws")' "$HOST_IDE_LOCK" \
+            > "$IDE_LOCK_DIR/${CLAUDE_CODE_SSE_PORT}.lock"
+        EXTRA_FLAGS+=(
+            -e "CLAUDE_CODE_SSE_PORT=$CLAUDE_CODE_SSE_PORT"
+            -e "CLAUDE_CODE_IDE_HOST_OVERRIDE=host.docker.internal"
+            -v "$IDE_LOCK_DIR:/home/claude/.claude/ide:ro"
+        )
+        for v in ENABLE_IDE_INTEGRATION TERMINAL_EMULATOR TERM_SESSION_ID \
+                 INTELLIJ_TERMINAL_COMMAND_BLOCKS_REWORKED FIG_TERM \
+                 PROCESS_LAUNCHED_BY_CW PROCESS_LAUNCHED_BY_Q; do
+            if [ -n "${!v:-}" ]; then
+                EXTRA_FLAGS+=(-e "${v}=${!v}")
+            fi
+        done
+    fi
+fi
+
+# 4. глобальные скиллы
+if [ -d "$HOME/.claude/skills" ]; then
+    EXTRA_FLAGS+=( -v "$HOME/.claude/skills:/home/claude/.claude/skills:ro" )
+fi
+
+# 5. проброс ~/.claude/ — монтировать только существующее:
+# несуществующий путь docker создаст как пустой dir под root.
+GLOBAL_CLAUDE_PATHS=(
+    "$HOME/.claude/CLAUDE.md:/home/claude/.claude/CLAUDE.md"
+    "$HOME/.claude/settings.json:/home/claude/.claude/settings.json"
+    "$HOME/.claude/settings.local.json:/home/claude/.claude/settings.local.json"
+    "$HOME/.claude/agents:/home/claude/.claude/agents"
+    "$HOME/.claude/scripts:/home/claude/.claude/scripts"
+    "$HOME/.claude/output-styles:/home/claude/.claude/output-styles"
+)
+GLOBAL_CLAUDE_MOUNTS=()
+for entry in "${GLOBAL_CLAUDE_PATHS[@]}"; do
+    src="${entry%%:*}"
+    dst="${entry##*:}"
+    if [ -e "$src" ]; then
+        GLOBAL_CLAUDE_MOUNTS+=(-v "${src}:${dst}:ro")
+    fi
+done
+
+# 6. cleanup-функция и trap СТАВЯТСЯ ДО docker run.
+# Ключ: cleanup идемпотентен на несуществующем контейнере (`docker stop ... 2>/dev/null || true`),
+# поэтому преждевременный фаер trap'а безопасен. Постановка trap ПОСЛЕ docker run -d оставляет
+# узкое окно: сигнал между завершением docker run и установкой trap → контейнер запущен, но
+# bash вышел без cleanup → утечка контейнера.
+cleanup() {
+    docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    [ -n "$IDE_LOCK_DIR" ] && rm -rf "$IDE_LOCK_DIR"
+    for f in "${SANITIZED_GITCONFIGS[@]:+${SANITIZED_GITCONFIGS[@]}}"; do
+        rm -f "$f"
+    done
+    if [ -n "$GIT_AUDIT_SNAPSHOT" ] && [ -f "$GIT_AUDIT_SNAPSHOT" ]; then
+        local after
+        after=$(mktemp /tmp/ccd-git-audit-after.XXXXXX) || after=""
+        if [ -n "$after" ]; then
+            {
+                find "$PROJECT_DIR" -maxdepth 4 -type f \( \
+                    -path '*/.git/hooks/*' -o \
+                    -path '*/.git/config' -o \
+                    -name '.gitattributes' -o \
+                    -name '.gitmodules' \
+                \) -print0 2>/dev/null \
+                | xargs -0 -r sha256sum 2>/dev/null
+            } > "$after" 2>/dev/null || true
+            if ! cmp -s "$GIT_AUDIT_SNAPSHOT" "$after"; then
+                echo "ccd: WARNING — git internals изменились во время сессии:" >&2
+                diff "$GIT_AUDIT_SNAPSHOT" "$after" 2>/dev/null \
+                    | sed -n 's/^[<>] *[a-f0-9]\{64\}  /  /p' \
+                    | sort -u >&2 || true
+                echo "ccd: проверьте .git/hooks/, .git/config, .gitattributes, .gitmodules перед хостовыми git-командами." >&2
+            fi
+            rm -f "$after"
+        fi
+        rm -f "$GIT_AUDIT_SNAPSHOT"
+    fi
+    if [ -n "$VPN_CONTAINER" ] && [ -n "$VPN_REFCOUNT_FILE" ]; then
+        (
+            flock -x 200
+            prune_refcount "remove"
+            if [ ! -s "$VPN_REFCOUNT_FILE" ]; then
+                docker stop "$VPN_CONTAINER" >/dev/null 2>&1 || true
+            fi
+        ) 200>"${VPN_REFCOUNT_FILE}.lock"
+    fi
+}
+trap cleanup EXIT INT TERM HUP
+
+# 7. запуск контейнера
+docker run -d --rm --name "$CONTAINER_NAME" \
+    --hostname "$CONTAINER_NAME" \
+    --entrypoint /bin/bash \
+    --network cc-net \
+    --add-host=host.docker.internal:host-gateway \
+    --cap-drop=ALL \
+    --security-opt=no-new-privileges \
+    -v claude-auth:/home/claude/.claude \
+    -v "$PROJECT_DIR:$PROJECT_DIR" \
+    -v "$CC_VOLUME:$CC_MOUNT:ro" \
+    -e "PATH=$CC_MOUNT/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    -e "DOCKER_HOST=tcp://cc-docker-proxy:2375" \
+    ${EXTRA_FLAGS[@]:+"${EXTRA_FLAGS[@]}"} \
+    ${GLOBAL_CLAUDE_MOUNTS[@]:+"${GLOBAL_CLAUDE_MOUNTS[@]}"} \
+    -w "$PROJECT_DIR" \
+    "$IMAGE" \
+    -c "sleep infinity" >/dev/null
+
+# 8. подключить к compose-сетям. Берём высокий IP в подсети, а не дефолтный
+# «нижний свободный» от IPAM. Иначе cc-контейнер занимает .2/.3, и compose-
+# сервис, который через `ipv4_address:` резервирует себе фиксированный
+# нижний адрес, при следующем `up` валится с "Address already in use".
+# (Реальный случай: compose-файл проекта через `ipv4_address:` фиксирует
+# себе нижний адрес типа 172.20.0.2 — без сдвига cc-контейнер забирает его первым.)
+calc_high_ips() {
+    local subnet="$1"
+    local ip="${subnet%/*}"
+    local prefix="${subnet#*/}"
+    [[ "$prefix" =~ ^[0-9]+$ ]] && [ "$prefix" -ge 8 ] && [ "$prefix" -le 28 ] || return 1
+
+    local o1 o2 o3 o4
+    IFS=. read -r o1 o2 o3 o4 <<< "$ip"
+    local int_ip=$(( (o1 << 24) | (o2 << 16) | (o3 << 8) | o4 ))
+    local broadcast=$(( int_ip | ((1 << (32 - prefix)) - 1) ))
+
+    local i n
+    for ((i = 2; i <= 6; i++)); do
+        n=$(( broadcast - i ))
+        printf '%d.%d.%d.%d\n' \
+            $(( (n >> 24) & 0xFF )) $(( (n >> 16) & 0xFF )) \
+            $(( (n >>  8) & 0xFF )) $((  n        & 0xFF ))
+    done
+}
+
+for net in "${COMPOSE_NETWORKS[@]}"; do
+    [ -z "$net" ] && continue
+    if ! docker network inspect "$net" >/dev/null 2>&1; then
+        echo "ccd: WARNING — network '$net' not found (compose stack likely not running). Container will not reach services on this network." >&2
+        continue
+    fi
+
+    connected=0
+    subnet=$(docker network inspect "$net" \
+        --format '{{range .IPAM.Config}}{{.Subnet}}{{"\n"}}{{end}}' \
+        | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' | head -1)
+    if [ -n "$subnet" ]; then
+        while IFS= read -r candidate_ip; do
+            [ -z "$candidate_ip" ] && continue
+            if docker network connect --ip "$candidate_ip" "$net" "$CONTAINER_NAME" >/dev/null 2>&1; then
+                connected=1
+                break
+            fi
+        done < <(calc_high_ips "$subnet" 2>/dev/null || true)
+    fi
+
+    if [ "$connected" -eq 0 ]; then
+        if ! docker network connect "$net" "$CONTAINER_NAME" >/dev/null 2>&1; then
+            echo "ccd: WARNING — failed to attach $CONTAINER_NAME to network '$net'." >&2
+        fi
+    fi
+done
+
+# 9. регистрация в VPN refcount
+if [ -n "$VPN_CONTAINER" ] && [ -n "$VPN_REFCOUNT_FILE" ]; then
+    mkdir -p "$(dirname "$VPN_REFCOUNT_FILE")"
+    touch "$VPN_REFCOUNT_FILE"
+    (
+        flock -x 200
+        prune_refcount "add"
+    ) 200>"${VPN_REFCOUNT_FILE}.lock"
+fi
+
+# 10. интерактив (БЕЗ exec! exec заменяет bash на docker exec и убивает trap'ы EXIT/HUP/INT/TERM).
+CLAUDE_ARGS=(--dangerously-skip-permissions)
+[ -n "${CLAUDE_CODE_SSE_PORT:-}" ] && CLAUDE_ARGS+=(--ide)
+[ -f "$PROJECT_MCP_HOST" ] && CLAUDE_ARGS+=(--mcp-config "$PROJECT_MCP_CONTAINER" --strict-mcp-config)
+docker exec -it -e "TERM=${TERM:-xterm-256color}" "$CONTAINER_NAME" \
+    claude "${CLAUDE_ARGS[@]}" "$@"
