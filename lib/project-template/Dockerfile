@@ -15,6 +15,14 @@ USER root
 #     && rm -rf /var/lib/apt/lists/*
 
 # Example: Playwright + Chromium (heavy dependencies)
+# Reference: <setup>/wiam/{Dockerfile,mcp.json} + <projects-root>/wiam/.claude/playwright-mcp-config.json
+# Notes for cap-drop=ALL containers (the ccd default):
+#   - In mcp.json args, do NOT pass --browser=chromium — "chromium" is not a valid
+#     MCP CLI value (allowed: chrome/firefox/webkit/msedge). Chromium is the default.
+#   - --browser-arg does NOT exist. Pass chromium flags via launchOptions.args
+#     in a --config <path> JSON file.
+#   - chromium will fail with "No usable sandbox" — set "chromiumSandbox": false
+#     in launchOptions of the same --config file (NOT the chromium --no-sandbox flag).
 # RUN apt-get update && apt-get install -y --no-install-recommends \
 #         libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libdbus-1-3 \
 #         libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
