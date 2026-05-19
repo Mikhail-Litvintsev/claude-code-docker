@@ -428,5 +428,8 @@ fi
 CLAUDE_ARGS=(--dangerously-skip-permissions)
 [ -n "${CLAUDE_CODE_SSE_PORT:-}" ] && CLAUDE_ARGS+=(--ide)
 [ -f "$PROJECT_MCP_HOST" ] && CLAUDE_ARGS+=(--mcp-config "$PROJECT_MCP_CONTAINER" --strict-mcp-config)
-docker exec -it -e "TERM=${TERM:-xterm-256color}" "$CONTAINER_NAME" \
+docker exec -it \
+    -e "TERM=${TERM:-xterm-256color}" \
+    -e "CLAUDE_CODE_EFFORT_LEVEL=${CLAUDE_CODE_EFFORT_LEVEL:-max}" \
+    "$CONTAINER_NAME" \
     claude "${CLAUDE_ARGS[@]}" "$@"
