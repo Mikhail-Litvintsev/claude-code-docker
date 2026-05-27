@@ -142,6 +142,11 @@ CONTAINER_NAME_PREFIX=cc-expro
 COMPOSE_NETWORKS=("proxy" "expro-db")
 VPN_CONTAINER=cc-expro-vpn
 VPN_REFCOUNT_FILE="$PROJECT_DIR/.claude/cc-expro-vpn.users"
+VPN_IMAGE=cc-expro-vpn-image
+VPN_CREATE_ARGS=(
+    -e DB_REMOTE_HOST=198.51.100.10 -e DB_REMOTE_PORT=5433
+    -v "$SETUP_DIR/$PROJECT_NAME/vpn-config:/etc/xray:ro"
+)
 EXPOSE_GIT_IDENTITY=1
 EXPOSE_GIT_PUSH=0
 EXPOSE_GITCONFIG=0
@@ -180,27 +185,32 @@ else
 fi
 
 # === 7. cc-expro-vpn (container; create without run) =================
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/ccd-config.sh"
+
+vpn_config_hash=$(printf '%s\0' "${VPN_CREATE_ARGS[@]:+${VPN_CREATE_ARGS[@]}}" | sha256sum | cut -d' ' -f1)
+vpn_actual_hash=$(docker inspect -f '{{index .Config.Labels "ccd.config-hash"}}' "$VPN_CONTAINER" 2>/dev/null || true)
+
 need_recreate_vpn=0
 if [ "$need_rebuild_vpn_image" -eq 1 ]; then
     need_recreate_vpn=1
-elif ! cc_container_exists cc-expro-vpn; then
+elif [ "$vpn_config_hash" != "$vpn_actual_hash" ]; then
     need_recreate_vpn=1
 fi
 
 if [ "$need_recreate_vpn" -eq 1 ]; then
-    if cc_container_running cc-expro-vpn; then
-        docker stop cc-expro-vpn >/dev/null
+    if cc_container_running "$VPN_CONTAINER"; then
+        docker stop "$VPN_CONTAINER" >/dev/null
     fi
-    docker rm -f cc-expro-vpn >/dev/null 2>&1 || true
-    docker create --name cc-expro-vpn --network cc-net \
-        -e DB_REMOTE_HOST=198.51.100.10 \
-        -e DB_REMOTE_PORT=5433 \
-        -v "$SCRIPT_DIR/vpn-config:/etc/xray:ro" \
-        cc-expro-vpn-image >/dev/null \
-        || cc_die "failed to create cc-expro-vpn"
-    cc_log_ok "cc-expro-vpn created"
+    docker rm -f "$VPN_CONTAINER" >/dev/null 2>&1 || true
+    docker create --name "$VPN_CONTAINER" --network cc-net \
+        --label "ccd.config-hash=$vpn_config_hash" \
+        ${VPN_CREATE_ARGS[@]:+"${VPN_CREATE_ARGS[@]}"} \
+        "$VPN_IMAGE" >/dev/null \
+        || cc_die "failed to create $VPN_CONTAINER"
+    cc_log_ok "$VPN_CONTAINER created"
 else
-    cc_log_skip "cc-expro-vpn"
+    cc_log_skip "$VPN_CONTAINER"
 fi
 
 cc_log_ok "$PROJECT_NAME/init.sh: ok"

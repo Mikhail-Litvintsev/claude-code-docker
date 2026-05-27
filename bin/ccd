@@ -93,6 +93,10 @@ if [ "$(docker inspect -f '{{.State.Status}}' cc-docker-proxy 2>/dev/null || ech
     exit 1
 fi
 
+# Project-specific pre-start hook
+PRE_START_HOOK="$SETUP_DIR/$PROJECT_NAME/ccd-pre-start.sh"
+[ -f "$PRE_START_HOOK" ] && source "$PRE_START_HOOK"
+
 CONTAINER_NAME="${CONTAINER_NAME_PREFIX}-$$"
 CONTAINER_HOME=/home/claude
 

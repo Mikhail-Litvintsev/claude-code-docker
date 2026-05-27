@@ -27,6 +27,7 @@ Tested on **Ubuntu 22.04+**. A host-side `claude` binary is not required — `cc
 └── <project-name>/                         per-project settings (NOT in repo)
     ├── init.sh                             project initializer
     ├── ccd-config.sh                       generated (outside the project bind-mount — anti-tampering)
+    ├── ccd-pre-start.sh (opt.)             hook sourced by ccd before session launch
     ├── mcp.json                            project-level MCP
     ├── Dockerfile (opt.) FROM cc-image
     └── Dockerfile.<svc> + <svc>-config/ (opt.) service containers
@@ -135,6 +136,14 @@ A bash file with variables for the `ccd` wrapper. Lives in `<setup>/<project>/`,
 | `COMPOSE_NETWORKS` | bash array | List of compose networks. Empty `()` — no attach. |
 | `VPN_CONTAINER` | string | VPN container name. `""` — no VPN. |
 | `VPN_REFCOUNT_FILE` | path | Refcount file for active sessions holding the VPN open. |
+| `VPN_IMAGE` | string | (opt.) VPN container image. Required for config-hash auto-recreation. |
+| `VPN_CREATE_ARGS` | bash array | (opt.) Extra `docker create` args for the VPN container (ports, env, volumes). |
+
+### Pre-start hook
+
+If `<setup>/<project>/ccd-pre-start.sh` exists, `ccd` sources it before launching the session container. Use it for project-specific validation — e.g. checking that a service container's config (ports, env vars) matches `ccd-config.sh` and recreating it on drift.
+
+When `VPN_IMAGE` and `VPN_CREATE_ARGS` are set in `ccd-config.sh`, the standard `ccd-pre-start.sh` computes a sha256 hash of `VPN_CREATE_ARGS`, stores it as a `ccd.config-hash` docker label on the VPN container, and compares on each run. Any mismatch (including a missing container) triggers automatic recreation — no manual `docker rm` needed.
 
 ### Git-RCE protection
 
