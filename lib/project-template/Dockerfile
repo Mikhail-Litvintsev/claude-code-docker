@@ -17,6 +17,10 @@ USER root
 # Example: Playwright + Chromium (heavy dependencies)
 # Reference: <setup>/wiam/{Dockerfile,mcp.json} + <projects-root>/wiam/.claude/playwright-mcp-config.json
 # Notes for cap-drop=ALL containers (the ccd default):
+#   - In mcp.json set "command": "/usr/local/bin/playwright-mcp" (the baked bin),
+#     NOT "npx @playwright/mcp@latest": npx re-resolves to a newer release whose
+#     Chromium revision is not installed in the image, so browser calls fail with
+#     "browser is not installed". Rebuild the image to update; the bin always matches.
 #   - In mcp.json args, do NOT pass --browser=chromium — "chromium" is not a valid
 #     MCP CLI value (allowed: chrome/firefox/webkit/msedge). Chromium is the default.
 #   - --browser-arg does NOT exist. Pass chromium flags via launchOptions.args

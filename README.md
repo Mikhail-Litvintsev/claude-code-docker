@@ -188,12 +188,18 @@ Project-level MCP config is `<setup>/<project>/mcp.json` (outside the bind-mount
   "mcpServers": {
     "playwright": {
       "type": "stdio",
-      "command": "npx",
-      "args": ["@playwright/mcp@latest", "--browser=chromium"]
+      "command": "/usr/local/bin/playwright-mcp",
+      "args": [
+        "--headless", "--isolated",
+        "--config",     "<projects-root>/<project>/.claude/playwright-mcp-config.json",
+        "--output-dir", "<projects-root>/<project>/.playwright-mcp"
+      ]
     }
   }
 }
 ```
+
+> Use the baked binary `/usr/local/bin/playwright-mcp`, not `npx @playwright/mcp@latest`. The image installs `@playwright/mcp` plus a matching Chromium at build time. `npx ...@latest` re-resolves to a newer release whose Chromium revision was never installed, so every browser call fails with "browser is not installed". Rebuild the project image to update; the binary always matches its baked Chromium.
 
 IDE-MCP (PhpStorm, etc.) is wired up separately — via an IDE lock-file bind-mount + `CLAUDE_CODE_SSE_PORT`.
 
