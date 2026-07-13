@@ -95,7 +95,10 @@ fi
 
 # Project-specific pre-start hook
 PRE_START_HOOK="$SETUP_DIR/$PROJECT_NAME/ccd-pre-start.sh"
-[ -f "$PRE_START_HOOK" ] && source "$PRE_START_HOOK"
+if [ -f "$PRE_START_HOOK" ]; then
+    # shellcheck source=/dev/null
+    source "$PRE_START_HOOK"
+fi
 
 CONTAINER_NAME="${CONTAINER_NAME_PREFIX}-$$"
 CONTAINER_HOME=/home/claude
