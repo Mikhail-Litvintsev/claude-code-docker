@@ -287,6 +287,7 @@ GLOBAL_CLAUDE_PATHS=(
     "$HOME/.claude/agents:/home/claude/.claude/agents"
     "$HOME/.claude/scripts:/home/claude/.claude/scripts"
     "$HOME/.claude/output-styles:/home/claude/.claude/output-styles"
+    "$HOME/.claude/guidelines:/home/claude/.claude/guidelines"
 )
 GLOBAL_CLAUDE_MOUNTS=()
 for entry in "${GLOBAL_CLAUDE_PATHS[@]}"; do
