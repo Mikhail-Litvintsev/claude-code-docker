@@ -8,6 +8,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ripgrep fd-find jq \
     && rm -rf /var/lib/apt/lists/*
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        poppler-utils \
+        python3 python3-openpyxl \
+        libreoffice-core-nogui libreoffice-writer-nogui \
+        libreoffice-calc-nogui libreoffice-impress-nogui \
+        fonts-dejavu-core fonts-liberation2 \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/debian/gpg \
         | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
@@ -32,6 +40,7 @@ RUN mkdir -p /home/claude/.ssh \
 RUN mkdir -p /home/claude/.claude && chown -R claude:claude /home/claude/.claude
 RUN mkdir -p /home/claude/.config/ccd && chown -R claude:claude /home/claude/.config
 
+ENV LANG=C.UTF-8
 ENV CLAUDE_CONFIG_DIR=/home/claude/.claude
 
 ENTRYPOINT []

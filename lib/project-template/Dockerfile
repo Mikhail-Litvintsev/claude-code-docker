@@ -3,6 +3,11 @@
 # psql/mysql/mongo clients, browser libs for Playwright, php/python/ruby/go,
 # kubectl, aws, redis-cli, etc.
 #
+# Already in cc-image, do NOT duplicate: git, curl, jq, ripgrep, fd-find,
+# docker-cli + compose plugin, LANG=C.UTF-8, and the document conversion
+# toolchain used by ~/.claude/scripts/pipeline-sources.sh: poppler-utils
+# (pdftotext), libreoffice-*-nogui (soffice), python3 + python3-openpyxl.
+#
 # If the base cc-image is enough, this Dockerfile is not needed,
 # and ccd-config.sh should keep IMAGE=cc-image.
 

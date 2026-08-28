@@ -38,7 +38,7 @@ Tested on **Ubuntu 22.04+**. A host-side `claude` binary is not required — `cc
 
 | Resource | Purpose |
 |---|---|
-| `cc-image` | base image (FROM `node:22-slim` + git/curl/jq/rg/docker-cli) |
+| `cc-image` | base image (FROM `node:22-slim` + git/curl/jq/rg/docker-cli + document conversion: poppler-utils, LibreOffice headless, python3/openpyxl) |
 | `cc-image-<project>` | (opt.) per-project extension |
 | `cc-net` | docker network for service containers |
 | `cc-docker-proxy` | docker.sock proxy with whitelist |
