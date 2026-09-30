@@ -433,11 +433,17 @@ if [ -n "$VPN_CONTAINER" ] && [ -n "$VPN_REFCOUNT_FILE" ]; then
 fi
 
 # 10. Interactive session (NO exec! exec would replace bash with docker exec and kill EXIT/HUP/INT/TERM traps).
+# Session effort goes as the --effort flag: the CLAUDE_CODE_EFFORT_LEVEL env var would override the effort set in every
+# subagent definition (~/.claude/agents/*.md), the flag does not. `ccd --effort <level>` starts at another level.
 CLAUDE_ARGS=(--dangerously-skip-permissions)
 [ -n "${CLAUDE_CODE_SSE_PORT:-}" ] && CLAUDE_ARGS+=(--ide)
 [ -f "$PROJECT_MCP_HOST" ] && CLAUDE_ARGS+=(--mcp-config "$PROJECT_MCP_CONTAINER" --strict-mcp-config)
+effort_given=0
+for arg in "$@"; do
+    case "$arg" in --effort|--effort=*) effort_given=1 ;; esac
+done
+[ "$effort_given" -eq 0 ] && CLAUDE_ARGS+=(--effort max)
 docker exec -it \
     -e "TERM=${TERM:-xterm-256color}" \
-    -e "CLAUDE_CODE_EFFORT_LEVEL=${CLAUDE_CODE_EFFORT_LEVEL:-max}" \
     "$CONTAINER_NAME" \
     claude "${CLAUDE_ARGS[@]}" "$@"
