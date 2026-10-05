@@ -442,7 +442,7 @@ effort_given=0
 for arg in "$@"; do
     case "$arg" in --effort|--effort=*) effort_given=1 ;; esac
 done
-[ "$effort_given" -eq 0 ] && CLAUDE_ARGS+=(--effort max)
+[ "$effort_given" -eq 0 ] && CLAUDE_ARGS+=(--effort high)
 docker exec -it \
     -e "TERM=${TERM:-xterm-256color}" \
     "$CONTAINER_NAME" \
