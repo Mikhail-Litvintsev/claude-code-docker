@@ -62,7 +62,8 @@ If scripts or configs reference an external host via `127.0.0.1:<port>` (the typ
 The base `cc-image` already carries document conversion for `~/.claude/scripts/pipeline-sources.sh` (`pdftotext`, `soffice`, `python3` + `openpyxl`). Do not re-install it per project. It also sets `LANG=C.UTF-8`: without a UTF-8 locale `soffice --convert-to txt:Text` replaces every non-ASCII character with `?`, so a Cyrillic docx converts to garbage. Do not unset or override `LANG` in a project Dockerfile.
 
 What the project uses that is not in the base `cc-image`:
-- Playwright/Cypress — browser libs + Chromium. Under `--cap-drop=ALL` (the ccd default) chromium fails to set up its sandbox: launch with `chromiumSandbox: false` in `launchOptions` of the playwright `--config` file. Do NOT pass `--browser=chromium` (not a valid MCP CLI value — chromium is the default) and do NOT use `--browser-arg` (does not exist). For dev domains pointing at a host-side nginx-proxy (typical `127.0.0.1 *.lc` in host `/etc/hosts`, absent in the container), pass `--host-resolver-rules=MAP *.<tld> <proxy-service-name>` via `launchOptions.args`. Reference end-to-end setup: `<setup>/wiam/{Dockerfile,mcp.json}` + `<projects-root>/wiam/.claude/playwright-mcp-config.json`.
+- Playwright/Cypress — browser libs + Chromium. Under `--cap-drop=ALL` (the ccd default) chromium fails to set up its sandbox: launch with `chromiumSandbox: false` in `launchOptions` of the playwright `--config` file. Do NOT pass `--browser=chromium` (not a valid MCP CLI value — chromium is the default) and do NOT use `--browser-arg` (does not exist). For dev domains pointing at a host-side nginx-proxy (typical `127.0.0.1 *.lc` in host `/etc/hosts`, absent in the container), pass `--host-resolver-rules=MAP *.<tld> <proxy-service-name>` via `launchOptions.args`. Dockerfile example: `<setup>/lib/project-template/Dockerfile`, `mcp.json` and `playwright-mcp-config.json` snippets: README § MCP servers.
+- Chrome DevTools MCP (`chrome-devtools-mcp`) — device emulation, throttling, performance traces, Lighthouse. Needs a real Chrome: install `google-chrome-stable` from the Google apt repo in the project Dockerfile; the server launches it by channel `stable`, the Playwright Chromium is not picked up. Under `--cap-drop=ALL` pass `--chrome-arg=--no-sandbox --chrome-arg=--disable-setuid-sandbox --chrome-arg=--disable-dev-shm-usage`. Dockerfile example: `<setup>/lib/project-template/Dockerfile`, `mcp.json` snippet: README § MCP servers.
 - `psql`, `mysql`, `mongo` clients;
 - `nc`, `redis-cli`, `kubectl`, `aws` CLI;
 - runtimes (php, python, ruby, go) — if you need to run the project's CLI inside the CC container.
@@ -160,7 +161,7 @@ cc_log_skip "project found: $PROJECT_DIR"
 # 7. Generate mcp.json (empty `{"mcpServers": {}}`) — only if the file is missing, otherwise SKIP
 # 7.1. Generate per-MCP-server configs in $PROJECT_DIR/.claude/<server>-config.json — only if missing,
 #      otherwise SKIP (same idempotency contract). Referenced from mcp.json by absolute path.
-#      Reference: <setup>/wiam/init.sh section 6.6 (playwright-mcp-config.json).
+#      Example content: README § MCP servers (playwright-mcp-config.json).
 # 8. Create service containers (config-hash based: source ccd-config.sh, compare hash of VPN_CREATE_ARGS
 #    against ccd.config-hash label on the container, recreate on mismatch)
 
@@ -262,7 +263,7 @@ After verification, the connection is complete. On a new machine the same projec
 
 ### Playwright / browser smoke in a cap-drop=ALL container
 
-Verified by end-to-end MCP JSON-RPC handshake on cc-image-wiam (April 2026, `@playwright/mcp` v1.60.0-alpha, chromium-1219). Surprises that cost time:
+Verified by end-to-end MCP JSON-RPC handshake on a project image (April 2026, `@playwright/mcp` v1.60.0-alpha, chromium-1219). Surprises that cost time:
 
 - `--browser=chromium` is **not** a valid MCP CLI value. Allowed: `chrome, firefox, webkit, msedge`. Chromium is the default — drop the flag.
 - `--browser-arg` does **not** exist as a MCP CLI option. Pass chromium command-line flags via `launchOptions.args` in a JSON config referenced by `--config <path>`.
@@ -271,6 +272,18 @@ Verified by end-to-end MCP JSON-RPC handshake on cc-image-wiam (April 2026, `@pl
 - DNS for compose services: any container on a `COMPOSE_NETWORKS` net resolves by its docker name (see `docker network inspect <net>`). Do NOT hardcode IPs — they shift on stack restart. For a host-side `nginx-proxy` reachable in the container only by its docker network IP, use `--host-resolver-rules=MAP *.<tld> <proxy-name>` in chromium args.
 - mkcert/local-CA HTTPS — chromium does not trust mkcert's CA in this image. Set `"ignoreHTTPSErrors": true` in `contextOptions` of the `--config` file. Don't rely on `--ignore-https-errors` CLI flag alone — keep it in the config for clarity.
 - **MCP command: the baked binary, never `npx ...@latest`.** In `mcp.json` set `"command": "/usr/local/bin/playwright-mcp"` (the global bin installed in the image). `npx @playwright/mcp@latest` re-resolves to the newest release at every launch, and its bundled playwright wants a Chromium revision the image never installed (`playwright install chromium` ran for the build-time version only), so every browser call fails with `"browser is not installed"`. The binary is identical to the baked `@playwright/mcp` and its Chromium, needs no network, and tracks the image on every rebuild. This was the real cause of "ccd can't see the browser": the image was correct, the runtime command was pulling a mismatched version.
+
+### Chrome DevTools MCP in a cap-drop=ALL container
+
+Verified by end-to-end MCP JSON-RPC handshake on a project image (October 2026, `chrome-devtools-mcp` 1.10.1, Google Chrome 155): `new_page`, `emulate` with `390x844x3,mobile,touch` + `Fast 4G` + 4x CPU, `take_screenshot`, `lighthouse_audit` in navigation mode, `performance_start_trace`. What matters:
+
+- **Browser resolution.** Without `--executablePath` the server calls puppeteer with `channel: 'chrome'`, which resolves only a system Google Chrome (`/opt/google/chrome/chrome`). The Playwright Chromium in `~/.cache/ms-playwright` is never considered, and `PUPPETEER_EXECUTABLE_PATH` is ignored because the channel is set. Install `google-chrome-stable` from `https://dl.google.com/linux/chrome/deb/` (amd64 only); it tracks the current stable on every rebuild, which is what the server requires.
+- **Sandbox.** Puppeteer does not add `--no-sandbox` by itself. Pass `--chrome-arg=--no-sandbox` and `--chrome-arg=--disable-setuid-sandbox` (the `--chrome-arg=<flag>` form, one flag per argument). Add `--chrome-arg=--disable-dev-shm-usage`: docker's 64 MB `/dev/shm` crashes tabs on heavy pages.
+- **Baked binary, same rule as Playwright.** `"command": "/usr/local/bin/chrome-devtools-mcp"`, never `npx chrome-devtools-mcp@latest`: a newer server may need a newer Chrome than the image holds, and `npx` adds a network round-trip on every start.
+- **Filesystem root.** `--filesystem-root <projects-root>/<project>/.chrome-devtools-mcp` limits where `filePath` arguments may write. The directory must exist at server start (realpath is resolved once), so the project `init.sh` creates it; add it to the project `.gitignore` next to `.playwright-mcp`.
+- **Config discovery.** The server auto-loads `cd4a.config.json` from the working directory (the project root inside the container) unless `CHROME_DEVTOOLS_MCP_NO_CONFIG_DISCOVERY=1` is set in `env`. Set it: a config planted in the repo could otherwise add `chromeArg`, `proxyServer` or `executablePath`.
+- **Telemetry off.** `--no-usage-statistics` and `--no-performance-crux` (trace URLs would otherwise be sent to Google's CrUX API), `CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS=1`.
+- **Reaching the app.** The CC container is on `COMPOSE_NETWORKS`, so the app is `http://<compose-service-container>/`, or `http://host.docker.internal:<host-port>/` through the published port. `localhost:<port>` from the project README is the host's address and does not resolve inside the container.
 
 ## Reference
 

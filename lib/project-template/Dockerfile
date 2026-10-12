@@ -20,7 +20,7 @@ USER root
 #     && rm -rf /var/lib/apt/lists/*
 
 # Example: Playwright + Chromium (heavy dependencies)
-# Reference: <setup>/wiam/{Dockerfile,mcp.json} + <projects-root>/wiam/.claude/playwright-mcp-config.json
+# Reference: README § MCP servers (mcp.json + playwright-mcp-config.json snippets)
 # Notes for cap-drop=ALL containers (the ccd default):
 #   - In mcp.json set "command": "/usr/local/bin/playwright-mcp" (the baked bin),
 #     NOT "npx @playwright/mcp@latest": npx re-resolves to a newer release whose
@@ -41,6 +41,24 @@ USER root
 # RUN npm install -g @playwright/mcp \
 #     && PW_VERSION="$(node -p "require('/usr/local/lib/node_modules/@playwright/mcp/node_modules/playwright/package.json').version")" \
 #     && npm install -g "playwright@${PW_VERSION}"
+
+# Example: Chrome DevTools MCP (device emulation, throttling, performance traces, Lighthouse)
+# Reference: README § MCP servers (mcp.json snippet)
+# Notes for cap-drop=ALL containers (the ccd default):
+#   - The server launches the system Google Chrome by channel; the Playwright Chromium
+#     above is NOT picked up, so install google-chrome-stable (amd64 only).
+#   - In mcp.json pass --chrome-arg=--no-sandbox --chrome-arg=--disable-setuid-sandbox
+#     --chrome-arg=--disable-dev-shm-usage, and set CHROME_DEVTOOLS_MCP_NO_CONFIG_DISCOVERY=1 in env.
+#   - --filesystem-root must point at an existing directory (create it in the project init.sh).
+# RUN curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+#         | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg \
+#     && chmod a+r /etc/apt/keyrings/google-chrome.gpg \
+#     && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
+#         > /etc/apt/sources.list.d/google-chrome.list \
+#     && apt-get update \
+#     && apt-get install -y --no-install-recommends google-chrome-stable \
+#     && rm -rf /var/lib/apt/lists/*
+# RUN npm install -g chrome-devtools-mcp
 
 USER claude
 
