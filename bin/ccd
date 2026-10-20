@@ -349,6 +349,17 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM HUP
 
+# 6b. User-level hooks: sourced in lexical order right before docker run.
+# They live outside the setup dir and may append to EXTRA_FLAGS.
+CCD_HOOKS_DIR="${CCD_HOOKS_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ccd/hooks.d}"
+if [ -d "$CCD_HOOKS_DIR" ]; then
+    for user_hook in "$CCD_HOOKS_DIR"/*.sh; do
+        [ -f "$user_hook" ] || continue
+        # shellcheck source=/dev/null
+        source "$user_hook"
+    done
+fi
+
 # 7. Launch the container
 docker run -d --rm --name "$CONTAINER_NAME" \
     --hostname "$CONTAINER_NAME" \

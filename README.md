@@ -145,6 +145,10 @@ If `<setup>/<project>/ccd-pre-start.sh` exists, `ccd` sources it before launchin
 
 When `VPN_IMAGE` and `VPN_CREATE_ARGS` are set in `ccd-config.sh`, the standard `ccd-pre-start.sh` computes a sha256 hash of `VPN_CREATE_ARGS`, stores it as a `ccd.config-hash` docker label on the VPN container, and compares on each run. Any mismatch (including a missing container) triggers automatic recreation — no manual `docker rm` needed.
 
+### User-level hooks
+
+Tools that are not part of ccd and not part of a project (a remote-control bridge, a telemetry sidecar, extra mounts) plug in through `${XDG_CONFIG_HOME:-$HOME/.config}/ccd/hooks.d/*.sh` (override the directory with `CCD_HOOKS_DIR`). `ccd` sources every `*.sh` there in lexical order right before `docker run`, after all its own `EXTRA_FLAGS` are assembled. A hook sees `PROJECT_NAME`, `PROJECT_DIR`, `CONTAINER_NAME`, `CONTAINER_HOME`, `IMAGE` and may append `docker run` options to the `EXTRA_FLAGS` array; a later `-e PATH=...` overrides the one ccd sets. Nothing in the setup dir or the project references these hooks, so removing the directory removes the integration.
+
 ### Git-RCE protection
 
 | Variable | Default | What it does | What it breaks |
