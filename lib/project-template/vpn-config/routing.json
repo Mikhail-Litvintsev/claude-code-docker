@@ -1,0 +1,49 @@
+{
+  "dns": {
+    "servers": [
+      "https://1.1.1.1/dns-query",
+      "https://dns.google/dns-query"
+    ],
+    "queryStrategy": "UseIPv4",
+    "hosts": {
+      "git.example.com": "198.51.100.10"
+    }
+  },
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "corp",
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIPv4"
+      },
+      "proxySettings": {
+        "tag": "vpn"
+      }
+    }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "outboundTag": "corp",
+        "domain": [
+          "domain:example.com"
+        ]
+      },
+      {
+        "outboundTag": "corp",
+        "ip": [
+          "198.51.100.10/32"
+        ]
+      },
+      {
+        "outboundTag": "direct",
+        "network": "tcp,udp"
+      }
+    ]
+  }
+}

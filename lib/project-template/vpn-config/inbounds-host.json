@@ -1,0 +1,26 @@
+{
+  "inbounds": [
+    {
+      "tag": "socks",
+      "listen": "127.0.0.1",
+      "port": 10808,
+      "protocol": "socks",
+      "settings": {"udp": true},
+      "sniffing": {"enabled": true, "destOverride": ["http", "tls"], "routeOnly": true}
+    },
+    {
+      "tag": "http",
+      "listen": "127.0.0.1",
+      "port": 10809,
+      "protocol": "http",
+      "sniffing": {"enabled": true, "destOverride": ["http", "tls"], "routeOnly": true}
+    },
+    {
+      "tag": "db-remote",
+      "listen": "127.0.0.1",
+      "port": 15433,
+      "protocol": "dokodemo-door",
+      "settings": {"address": "198.51.100.10", "port": 5433, "network": "tcp"}
+    }
+  ]
+}

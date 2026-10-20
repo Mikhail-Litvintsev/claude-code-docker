@@ -56,7 +56,7 @@ Read each one. Signs of a host-bound script:
 Each such script is a candidate for adaptation (Step 6).
 
 ### 1.3. VPN/tunnel to remote infrastructure
-If scripts or configs reference an external host via `127.0.0.1:<port>` (the typical sign of an SSH tunnel or socat relay on the host), and the real host is not directly reachable from the container network — **a service VPN container is needed** in the shared `cc-net` network. Container name: `cc-<project-name>-vpn`. Typical implementation: xray + socat inside the service container. Templates: `<setup>/lib/project-template/Dockerfile.vpn` and `<setup>/lib/project-template/vpn-entrypoint.sh` — copied into `<setup>/<project-name>/` unchanged; project-specific customization goes only into `vpn-config/config.json` (xray config with the real upstream) and the `DB_REMOTE_HOST`/`DB_REMOTE_PORT` variables in the `docker create` call inside the project init.sh. The skeleton init.sh that builds such a container is `<setup>/lib/project-template/init.sh`.
+If scripts or configs reference an external host via `127.0.0.1:<port>` (the typical sign of an SSH tunnel or socat relay on the host), or corporate hosts (git, tracker, DB) are reachable only through a VPN — **a service gateway container is needed** in the shared `cc-net` network. Container name: `cc-<project-name>-vpn`. Implementation: a bare xray (`<setup>/lib/project-template/Dockerfile.vpn`, copied unchanged) that reads three config files from `vpn-config/`: `outbound.json` (the secret VPN outbound, generated from the provider's vless link by `<setup>/lib/xray-outbound-from-link.py`), `routing.json` (which domains/IPs go through the VPN; everything else goes direct; corporate rules point to a `corp` freedom outbound chained through `vpn` via `proxySettings`, so hostnames are resolved locally over DoH and the VPN server receives IPs) and `inbounds-container.json` (what the gateway listens on: SOCKS/HTTP proxies, `dokodemo-door` port forwards to DB hosts, and ports 22/443 forwarded to the corporate git host with TLS sniffing). The container gets `--network-alias <corporate-host>` for every corporate hostname, so session containers resolve e.g. `git.example.com` to the gateway over Docker DNS and need no proxy settings at all: only corporate destinations go through the VPN, everything else (Claude API, package registries) goes direct. The same `outbound.json` + `routing.json` with `inbounds-host.json` serve the host (systemd user service), so Chrome, PhpStorm and the console share one routing policy. Examples: `<setup>/lib/project-template/vpn-config/`.
 
 ### 1.4. System requirements
 The base `cc-image` already carries document conversion for `~/.claude/scripts/pipeline-sources.sh` (`pdftotext`, `soffice`, `python3` + `openpyxl`). Do not re-install it per project. It also sets `LANG=C.UTF-8`: without a UTF-8 locale `soffice --convert-to txt:Text` replaces every non-ASCII character with `?`, so a Cyrillic docx converts to garbage. Do not unset or override `LANG` in a project Dockerfile.
@@ -122,7 +122,7 @@ Inside `<projects-root>/<project-name>/.claude/`:
 
 ## Step 4. Implement `<setup>/<project-name>/init.sh`
 
-A full working example with a VPN container is `<setup>/lib/project-template/init.sh`. The project name in the template is `expro` (example project); when adapting, replace `expro` with `<project-name>`, `EXPRO_*` variables with `<PROJECT_NAME>_*`, adjust `COMPOSE_NETWORKS` and `DB_REMOTE_HOST`, drop the VPN/credentials blocks if the project does not need them. The template's neighboring files (`Dockerfile`, `Dockerfile.vpn`, `vpn-entrypoint.sh`, `mcp.json`) are copied into `<setup>/<project-name>/` as needed — see Step 3.
+A full working example with a VPN container is `<setup>/lib/project-template/init.sh`. The project name in the template is `expro` (example project); when adapting, replace `expro` with `<project-name>`, `EXPRO_*` variables with `<PROJECT_NAME>_*`, adjust `COMPOSE_NETWORKS`, the hosts in `vpn-config/` and the `--network-alias` list, drop the VPN/credentials blocks if the project does not need them. The template's neighboring files (`Dockerfile`, `Dockerfile.vpn`, `vpn-config/`, `mcp.json`) are copied into `<setup>/<project-name>/` as needed — see Step 3.
 
 Minimal skeleton (no VPN, no project Dockerfile, no credentials):
 
@@ -192,9 +192,8 @@ COMPOSE_NETWORKS=("net1" "net2")        # from Step 1.1; empty array () if none 
 VPN_CONTAINER=cc-<project-name>-vpn     # empty string "", if VPN not needed
 VPN_REFCOUNT_FILE="$PROJECT_DIR/.claude/cc-<project-name>-vpn.users"
 VPN_IMAGE=cc-<project-name>-vpn-image  # required for config-hash auto-recreation in ccd-pre-start.sh
-VPN_CREATE_ARGS=(                      # extra docker create args for the VPN container
-    -p 15433:15433
-    -e DB_REMOTE_HOST=198.51.100.10 -e DB_REMOTE_PORT=5433
+VPN_CREATE_ARGS=(                      # extra docker create args for the gateway container
+    --network-alias git.example.com    # one alias per corporate hostname the gateway serves
     -v "$SETUP_DIR/$PROJECT_NAME/vpn-config:/etc/xray:ro"
 )
 EXPOSE_GIT_IDENTITY=1   # CC commits as the user (sanitized bind-mount of ~/.gitconfig into /home/claude/.gitconfig:ro)
@@ -220,7 +219,7 @@ For each script:
    - Absolute host paths → paths inside the container, or relative paths.
    - Secret loading: instead of hardcoding — `source "$(dirname "$(realpath "$0")")/../<name>-credentials.env"`.
    - Mutation guards (for DB scripts): grep for forbidden operations (INSERT/UPDATE/DROP/...).
-4. **Do NOT manage service container lifecycle** — that is `bin/ccd`'s job via trap+refcount. The script only does `docker start <vpn>` (idempotent, in case of the first call) + `nc -z` readiness wait.
+4. **Do NOT manage service container lifecycle** — that is `bin/ccd`'s job via trap+refcount. The script only does `docker start <vpn>` (idempotent, in case of the first call) + `nc -z` readiness wait. Git, curl and other clients talking to a corporate hostname need nothing: the gateway's `--network-alias` makes the hostname resolve to it.
 5. `chmod 755`.
 6. Update project documentation (CLAUDE.md, README.md, etc.) — replace old paths and instructions with `.claude/scripts/<name>.sh`.
 
@@ -257,7 +256,7 @@ After verification, the connection is complete. On a new machine the same projec
 
 - On service-name collisions across projects, the `cc-<project-name>-<service>` convention guarantees isolation. Do NOT reuse service containers from other projects.
 - If a project init.sh fails, the root `init.sh` is not blocked — it iterates onward. The final summary will show `[FAIL] project <name>`. The root's exit code becomes non-zero.
-- All secrets (xray-config, db-credentials, anything project-specific) are generated ONLY when the file is missing. Never overwritten (see "Do not overwrite" in Step 4). The template (source of truth) lives inside the project init.sh; on field changes, old files are updated by hand after diagnostics.
+- All secrets (vpn-config/outbound.json, db-credentials, anything project-specific) are generated ONLY when the file is missing. Never overwritten (see "Do not overwrite" in Step 4). The template (source of truth) lives inside the project init.sh; on field changes, old files are updated by hand after diagnostics.
 - `<setup>/<project-name>/` as a whole is excluded from the setup repo. Moving to a new machine — copy it, or connect from scratch using this spec.
 - Claude Code OAuth is a separate one-time step **after** the first `ccd` run: the `claude-cc-bin` volume is warmed up by the `ccd` wrapper automatically; on the first start, CC inside the container initiates the OAuth flow.
 
@@ -291,17 +290,13 @@ Verified by end-to-end MCP JSON-RPC handshake on a project image (October 2026, 
 
 | File | Purpose |
 |---|---|
-| `init.sh` | full project init.sh example: image `cc-image-expro` (FROM `cc-image`), service `cc-expro-vpn-image` (FROM `debian:bookworm-slim`), copying xray config to `vpn-config/` (chmod 600), generation of `db-credentials.env` and `ccd-config.sh` without overwriting, config-hash based `docker create` for `cc-expro-vpn`, the flag cascade `--rebuild` / `--rebuild-base-derived` |
+| `init.sh` | full project init.sh example: image `cc-image-expro` (FROM `cc-image`), service `cc-expro-vpn-image` (FROM `debian:bookworm-slim`), check that `vpn-config/outbound.json` exists, generation of `db-credentials.env` and `ccd-config.sh` without overwriting, config-hash based `docker create` for `cc-expro-vpn`, the flag cascade `--rebuild` / `--rebuild-base-derived` |
 | `ccd-pre-start.sh` | pre-start hook: validates VPN container config hash, recreates on drift. Sourced by `ccd` before every session launch |
 | `Dockerfile` | minimal `FROM cc-image` with commented-out extension examples (postgres-client, Playwright). Drop it if the base `cc-image` is enough for the project |
-| `Dockerfile.vpn` | service xray + socat. Copied into the project unchanged; all specifics live in `vpn-config/config.json` + `DB_REMOTE_HOST`/`DB_REMOTE_PORT` env vars |
-| `vpn-entrypoint.sh` | VPN container entrypoint. Copied unchanged |
+| `Dockerfile.vpn` | gateway: bare xray reading `/etc/xray/{outbound,routing,inbounds-container}.json`. Copied into the project unchanged; all specifics live in `vpn-config/`. Keep `XRAY_VERSION` at v26.3.27 or newer: the chained `corp` outbound breaks HTTPS on 25.x |
+| `vpn-config/` | anonymized `routing.json`, `inbounds-host.json`, `inbounds-container.json`. `outbound.json` is a secret and is not in the template |
 | `mcp.json` | empty `{"mcpServers": {}}`. Filled in by hand or generated by the project init.sh |
 
-Reading `init.sh` end-to-end is the fastest way to grasp the layout. Adaptation: copy the whole folder (or the files you need) into `<setup>/<project-name>/`, replace `expro` → `<project-name>` (including the `EXPRO_*` env prefix), adjust `COMPOSE_NETWORKS` and `DB_REMOTE_HOST`, drop the VPN/credentials blocks if not needed.
+Reading `init.sh` end-to-end is the fastest way to grasp the layout. Adaptation: copy the whole folder (or the files you need) into `<setup>/<project-name>/`, replace `expro` → `<project-name>` (including the `EXPRO_*` env prefix), adjust `COMPOSE_NETWORKS`, the hosts in `vpn-config/` and the `--network-alias` list, drop the VPN/credentials blocks if not needed.
 
-`vpn-config/config.json` is NOT in the template — it's a secret. Two working paths:
-1. **Source of truth in the project**: drop `xray-config.json` into `<projects-root>/<project-name>/xray-config.json` (this is what the template `init.sh` does, section 2). On the first run, `init.sh` will copy it into `<setup>/<project-name>/vpn-config/config.json` (chmod 600). Convenient if the xray config is already in the project repo (with proper `.gitignore`!) or in the user's hands.
-2. **Source of truth in the setup folder**: drop `config.json` straight into `<setup>/<project-name>/vpn-config/config.json` by hand (chmod 600). `init.sh` will see the file and skip the copy. Convenient if you want the secret entirely outside the project repo.
-
-In both cases, after the first `init.sh` run, `<setup>/<project-name>/vpn-config/config.json` is the source of truth (and the same file is mounted read-only into the VPN container). Rotation: edit this file + `docker restart cc-<project-name>-vpn`.
+`vpn-config/outbound.json` is NOT in the template — it's a secret. Generate it from the provider's vless link: `python3 <setup>/lib/xray-outbound-from-link.py '<vless://...>' <setup>/<project-name>/vpn-config/outbound.json` (chmod 600 is applied by the script). `init.sh` only checks that the file exists. One folder is the single source of truth for both the host xray service and the gateway container (mounted read-only via `VPN_CREATE_ARGS`): `<setup>/<project-name>/vpn-config/` by default, or a folder outside the setup repo such as `~/.config/xray-<project-name>/` when the host service must keep working without the setup repo (then point both the systemd unit and the `-v` mount there and adjust the `init.sh` check). Rotation: regenerate `outbound.json` + `docker restart cc-<project-name>-vpn` + restart the host xray service. Adding a corporate host: `routing.json` rule, `--network-alias` in `VPN_CREATE_ARGS` (the config hash recreates the container on the next `ccd`), and a forward in `inbounds-container.json` if the port is not 22/443.

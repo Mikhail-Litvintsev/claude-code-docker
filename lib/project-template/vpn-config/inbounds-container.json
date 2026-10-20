@@ -1,0 +1,41 @@
+{
+  "inbounds": [
+    {
+      "tag": "socks",
+      "listen": "0.0.0.0",
+      "port": 10808,
+      "protocol": "socks",
+      "settings": {"udp": true},
+      "sniffing": {"enabled": true, "destOverride": ["http", "tls"], "routeOnly": true}
+    },
+    {
+      "tag": "http",
+      "listen": "0.0.0.0",
+      "port": 10809,
+      "protocol": "http",
+      "sniffing": {"enabled": true, "destOverride": ["http", "tls"], "routeOnly": true}
+    },
+    {
+      "tag": "git-ssh",
+      "listen": "0.0.0.0",
+      "port": 22,
+      "protocol": "dokodemo-door",
+      "settings": {"address": "git.example.com", "port": 22, "network": "tcp"}
+    },
+    {
+      "tag": "corp-https",
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "dokodemo-door",
+      "settings": {"address": "git.example.com", "port": 443, "network": "tcp"},
+      "sniffing": {"enabled": true, "destOverride": ["tls"]}
+    },
+    {
+      "tag": "db-remote",
+      "listen": "0.0.0.0",
+      "port": 15433,
+      "protocol": "dokodemo-door",
+      "settings": {"address": "198.51.100.10", "port": 5433, "network": "tcp"}
+    }
+  ]
+}

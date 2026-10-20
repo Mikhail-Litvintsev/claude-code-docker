@@ -24,17 +24,12 @@ done
 [ -d "$PROJECT_DIR" ] || cc_die "project $PROJECT_DIR not found (the setup folder name '$PROJECT_NAME' must match the project folder name)"
 cc_log_skip "project found: $PROJECT_DIR"
 
-# === 2. xray-config (secret, copied only when missing) ===============
-HOST_XRAY_SRC="$PROJECT_DIR/xray-config.json"
-TARGET_XRAY="$SCRIPT_DIR/vpn-config/config.json"
-if [ -f "$TARGET_XRAY" ]; then
-    cc_log_skip "vpn-config/config.json already in place"
+# === 2. vpn-config (outbound.json is a secret issued by the VPN provider) ==
+VPN_OUTBOUND="$SCRIPT_DIR/vpn-config/outbound.json"
+if [ -f "$VPN_OUTBOUND" ]; then
+    cc_log_skip "vpn-config/outbound.json already in place"
 else
-    [ -f "$HOST_XRAY_SRC" ] || cc_die "not found: $HOST_XRAY_SRC — the VPN container will not start without an xray config"
-    mkdir -p "$(dirname "$TARGET_XRAY")"
-    cp "$HOST_XRAY_SRC" "$TARGET_XRAY"
-    chmod 600 "$TARGET_XRAY"
-    cc_log_ok "vpn-config/config.json copied from $HOST_XRAY_SRC"
+    cc_die "not found: $VPN_OUTBOUND — generate it from the vless link: python3 $SETUP_DIR/lib/xray-outbound-from-link.py '<vless://...>' $VPN_OUTBOUND"
 fi
 
 # === 3. cc-image-expro (FROM cc-image — base-derived) ================
@@ -144,7 +139,7 @@ VPN_CONTAINER=cc-expro-vpn
 VPN_REFCOUNT_FILE="$PROJECT_DIR/.claude/cc-expro-vpn.users"
 VPN_IMAGE=cc-expro-vpn-image
 VPN_CREATE_ARGS=(
-    -e DB_REMOTE_HOST=198.51.100.10 -e DB_REMOTE_PORT=5433
+    --network-alias git.example.com
     -v "$SETUP_DIR/$PROJECT_NAME/vpn-config:/etc/xray:ro"
 )
 EXPOSE_GIT_IDENTITY=1

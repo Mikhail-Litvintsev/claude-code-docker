@@ -137,7 +137,7 @@ A bash file with variables for the `ccd` wrapper. Lives in `<setup>/<project>/`,
 | `VPN_CONTAINER` | string | VPN container name. `""` — no VPN. |
 | `VPN_REFCOUNT_FILE` | path | Refcount file for active sessions holding the VPN open. |
 | `VPN_IMAGE` | string | (opt.) VPN container image. Required for config-hash auto-recreation. |
-| `VPN_CREATE_ARGS` | bash array | (opt.) Extra `docker create` args for the VPN container (ports, env, volumes). |
+| `VPN_CREATE_ARGS` | bash array | (opt.) Extra `docker create` args for the VPN container (`--network-alias <corporate-host>` per hostname it serves, volumes). |
 
 ### Pre-start hook
 
@@ -285,7 +285,7 @@ For **full** isolation from project compose containers (untrusted code) — use 
 | `[FAIL] 'docker compose' not working` | `apt install docker-compose-plugin`. |
 | Files owned by `nobody:nogroup` after `ccd` | UID/GID mismatch — `bash init.sh` will rebuild `cc-image`. |
 | OAuth flow does not start | run `/login` inside the session. |
-| `cc-<project>-vpn` does not start | `docker logs cc-<project>-vpn`, inspect `<setup>/<project>/vpn-config/`. |
+| `cc-<project>-vpn` does not start | `docker logs cc-<project>-vpn`, validate `<setup>/<project>/vpn-config/` with `xray run -test -c outbound.json -c routing.json -c inbounds-container.json`. |
 
 ---
 
