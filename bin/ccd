@@ -26,6 +26,8 @@ fi
 COMPOSE_NETWORKS=()
 VPN_CONTAINER=""
 VPN_REFCOUNT_FILE=""
+CONTAINER_ENV=()
+SSH_AGENT_KEY=""
 # shellcheck source=/dev/null
 source "$SETUP_DIR/$PROJECT_NAME/ccd-config.sh"
 
@@ -200,10 +202,35 @@ if [ "${EXPOSE_GIT_IDENTITY:-0}" = "1" ]; then
     fi
 fi
 
-if [ "${EXPOSE_GIT_PUSH:-0}" = "1" ] \
+if [ "${EXPOSE_GIT_PUSH:-0}" = "1" ] && [ -n "${SSH_AGENT_KEY:-}" ]; then
+    # 3.3b Dedicated ccd agent: only SSH_AGENT_KEY is loaded, the user's own agent
+    # (with every other key) is never mounted into the container.
+    if [ ! -f "$SSH_AGENT_KEY" ]; then
+        echo "ccd: SSH_AGENT_KEY not found: $SSH_AGENT_KEY" >&2
+        exit 1
+    fi
+    CCD_AGENT_SOCK="${XDG_RUNTIME_DIR:-/tmp}/ccd-agent-$PROJECT_NAME.sock"
+    ccd_agent_state=0
+    SSH_AUTH_SOCK="$CCD_AGENT_SOCK" ssh-add -l >/dev/null 2>&1 || ccd_agent_state=$?
+    if [ "$ccd_agent_state" -eq 2 ]; then
+        rm -f "$CCD_AGENT_SOCK"
+        ssh-agent -a "$CCD_AGENT_SOCK" >/dev/null \
+            || { echo "ccd: failed to start ssh-agent at $CCD_AGENT_SOCK" >&2; exit 1; }
+    fi
+    if ! SSH_AUTH_SOCK="$CCD_AGENT_SOCK" ssh-add -l 2>/dev/null \
+            | grep -qF "$(ssh-keygen -lf "$SSH_AGENT_KEY" | awk '{print $2}')"; then
+        SSH_AUTH_SOCK="$CCD_AGENT_SOCK" ssh-add "$SSH_AGENT_KEY" >/dev/null 2>&1 \
+            || { echo "ccd: failed to add $SSH_AGENT_KEY to the ccd agent" >&2; exit 1; }
+    fi
+    EXTRA_FLAGS+=( -v "$CCD_AGENT_SOCK:/ssh-agent" -e "SSH_AUTH_SOCK=/ssh-agent" )
+elif [ "${EXPOSE_GIT_PUSH:-0}" = "1" ] \
     && [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
     EXTRA_FLAGS+=( -v "$SSH_AUTH_SOCK:/ssh-agent" -e "SSH_AUTH_SOCK=/ssh-agent" )
 fi
+
+for container_env in ${CONTAINER_ENV[@]:+"${CONTAINER_ENV[@]}"}; do
+    EXTRA_FLAGS+=( -e "$container_env" )
+done
 
 if [ "${EXPOSE_GITCONFIG:-0}" = "1" ] && [ -f "$HOME/.gitconfig" ]; then
     EXTRA_FLAGS+=( -v "$HOME/.gitconfig:$CONTAINER_HOME/.gitconfig:ro" )

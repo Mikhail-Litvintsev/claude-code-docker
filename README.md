@@ -24,6 +24,7 @@ Tested on **Ubuntu 22.04+**. A host-side `claude` binary is not required — `cc
 ├── bin/ccd                                 launcher wrapper
 ├── cc-docker-proxy/haproxy.cfg             docker API whitelist
 ├── lib/init-helpers.sh, project-template/  helpers + project template
+├── lib/api-broker.py                       API broker for the gateway container (keys stay in the gateway)
 └── <project-name>/                         per-project settings (NOT in repo)
     ├── init.sh                             project initializer
     ├── ccd-config.sh                       generated (outside the project bind-mount — anti-tampering)
@@ -46,6 +47,7 @@ Tested on **Ubuntu 22.04+**. A host-side `claude` binary is not required — `cc
 | `claude-cc-bin` (volume) | Claude Code binary, warmed up by `ccd` |
 | `cc-<project>-<pid>` | ephemeral per-session container (`--rm`) |
 | `cc-<project>-<svc>` | service container (refcount-managed by `ccd`) |
+| `cc-<project>-vpn` | gateway: xray tunnel plus the API broker (`lib/api-broker.py`) that keeps the service keys in the gateway (`~/.config/ticket-services/` mounted read-only) and forwards only the routes of its allow-list; session containers reach it as `TICKET_SERVICES_BROKER` |
 
 ---
 
