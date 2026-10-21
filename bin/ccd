@@ -144,7 +144,7 @@ sanitize_gitconfig() {
     while read -r url_sect; do
         [ -z "$url_sect" ] && continue
         git config --file "$dst" --remove-section "$url_sect" 2>/dev/null || true
-    done < <(git config --file "$dst" --get-regexp '^url\.' 2>/dev/null \
+    done < <(git config --file "$dst" --get-regexp '^(url|https?)\.' 2>/dev/null \
              | awk '{print $1}' | sed -E 's/\.[^.]+$//' | sort -u)
 
     local key
