@@ -20,7 +20,7 @@ Tested on **Ubuntu 22.04+**. A host-side `claude` binary is not required — `cc
 
 ```
 <setup>/                                    setup repository
-├── Dockerfile, init.sh, connect-project.md, project-account.md
+├── Dockerfile, init.sh, connect-project.md, project-account.md, host-setup.md
 ├── bin/ccd                                 launcher wrapper
 ├── bin/claude-host                         host-side claude launcher honoring the project account
 ├── cc-docker-proxy/haproxy.cfg             docker API whitelist
@@ -80,6 +80,8 @@ source ~/.bashrc   # to pick up the new PATH
 ```
 
 `init.sh` creates `cc-net`/`claude-auth`/`cc-docker-proxy`, builds `cc-image` against the host UID/GID, puts `<setup>/bin` first in PATH (it holds `ccd` and a `claude` that picks the project account), registers the account guard hook, and runs `<setup>/*/init.sh` for connected projects.
+
+On a new machine, or when moving an existing setup, go through `host-setup.md` first: it lists everything outside the repository (project folders with secrets, host `~/.claude`, logins, bridge and IDE settings, user services) and the order to restore it in.
 
 **Claude Code authorization (one-time):**
 
