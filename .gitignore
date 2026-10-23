@@ -11,3 +11,5 @@
 !/cc-docker-proxy
 !/lib
 !/README.md
+
+__pycache__/

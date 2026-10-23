@@ -11,12 +11,25 @@ The setup is split into two parts:
 - `<setup>/bin/ccd` — wrapper: walks up from `$PWD` to the ancestor that has `<setup>/<basename(ancestor)>/ccd-config.sh`, then launches the CC container for that project. The config lives in the setup repo, not in the project bind-mount (security: otherwise CC could change its own flags from inside the session).
 - `<setup>/cc-docker-proxy/haproxy.cfg` — config for the docker-API proxy (`tecnativa/docker-socket-proxy` + a custom deny rule on `/containers/create`); the root `init.sh` brings it up as the `cc-docker-proxy` container in `cc-net`. CC sessions talk to the docker daemon only through it (`DOCKER_HOST=tcp://cc-docker-proxy:2375`).
 - `<setup>/lib/init-helpers.sh` — bash helper functions (logging, idempotent docker checks).
+- `<setup>/lib/xray-outbound-from-link.py` converts the VPN provider's vless link into the gateway's `outbound.json` (chmod 600).
+- `<setup>/lib/api-broker.py` is the API broker that runs inside the gateway container next to xray. It reads the service keys from `/etc/ticket-services/*.env` (the host directory `~/.config/ticket-services/` mounted read-only into the gateway), listens on port 8080, forwards an allow-list of ticket-tracker routes (`/redmine/...`) and code-host routes (`/gitlab/api/v4/...`) upstream with the key attached, and answers 403 to every other path. The keys never enter the session container; the session only knows the broker address from `TICKET_SERVICES_BROKER`.
 - `<setup>/init.sh` — root initializer: prerequisites, the shared `cc-net` network, the `claude-auth` volume, the `cc-docker-proxy` container, building `cc-image`, PATH wiring in `~/.bashrc`, then iterating `<setup>/*/init.sh`.
 
 **Project settings** (NOT in the setup repo — local to each machine):
 - `<setup>/<project-name>/` — settings folder for a specific connected project. Paired with `<projects-root>/<project-name>/` (same name).
 
 The root `init.sh` iterates `<setup>/*/init.sh`. A folder is identified by the presence of `init.sh` inside it. Folders without `init.sh` (`bin/`, `lib/`, `cc-docker-proxy/`) are skipped silently.
+
+**What a session container gets from `bin/ccd`** (the full list; nothing else from the host reaches the session):
+- `<projects-root>/<project-name>/` bind-mounted read-write at the same absolute path, which is also the working directory. Inside it, `.git/hooks/` and `.git/config` of every repository found up to depth 4 are re-mounted read-only (`LOCK_GIT_INTERNALS=1`), and `.gitmodules` too when `LOCK_GITMODULES=1`.
+- The `claude-auth` volume at `/home/claude/.claude` (OAuth token shared by all projects) and the `claude-cc-bin` volume read-only at `/opt/claude`.
+- The host's `~/.claude/CLAUDE.md`, `settings.json`, `settings.local.json`, `agents/`, `scripts/`, `output-styles/`, `guidelines/`, `skills/` read-only, each only if it exists on the host.
+- `<setup>/<project-name>/mcp.json` read-only at `/home/claude/.config/ccd/mcp.json`, passed to CC as `--mcp-config ... --strict-mcp-config`.
+- The sanitized `~/.gitconfig` (`EXPOSE_GIT_IDENTITY=1`), an ssh-agent socket at `/ssh-agent` (`EXPOSE_GIT_PUSH=1`), the raw `~/.gitconfig` (`EXPOSE_GITCONFIG=1`), the `-e` variables of `CONTAINER_ENV`.
+- `DOCKER_HOST=tcp://cc-docker-proxy:2375`, `host.docker.internal` pointing at the host, the `cc-net` network plus every network of `COMPOSE_NETWORKS`.
+- Whatever the user-level hooks `~/.config/ccd/hooks.d/*.sh` (override: `CCD_HOOKS_DIR`) append to `EXTRA_FLAGS`; they are sourced right before `docker run` and are not part of a project.
+
+The host's `~/.ssh/`, `~/.config/` (including `~/.config/ticket-services/`), `~/.aws/` are not visible in the session.
 
 ## Conventions
 
@@ -30,6 +43,7 @@ The root `init.sh` iterates `<setup>/*/init.sh`. A folder is identified by the p
 Ask the user for:
 1. `<project-name>` — the project folder name (must match the folder in `<projects-root>`).
 2. Confirmation that `<projects-root>/<project-name>/` exists and is ready (repo cloned, dependencies installed).
+3. The project layout, **internal** or **external** (see Step 3, "Two project layouts"). Internal: the user's own project, the project folder is itself the git repository and `.claude/` is committed in it. External: a workspace over one or more repositories that belong to someone else; `.claude/` lives in the workspace outside every repository. The answer decides where local files go and whether any `.gitignore` is touched.
 
 ## Step 1. Analyze the project
 
@@ -56,7 +70,16 @@ Read each one. Signs of a host-bound script:
 Each such script is a candidate for adaptation (Step 6).
 
 ### 1.3. VPN/tunnel to remote infrastructure
-If scripts or configs reference an external host via `127.0.0.1:<port>` (the typical sign of an SSH tunnel or socat relay on the host), or corporate hosts (git, tracker, DB) are reachable only through a VPN — **a service gateway container is needed** in the shared `cc-net` network. Container name: `cc-<project-name>-vpn`. Implementation: a bare xray (`<setup>/lib/project-template/Dockerfile.vpn`, copied unchanged) that reads three config files from `vpn-config/`: `outbound.json` (the secret VPN outbound, generated from the provider's vless link by `<setup>/lib/xray-outbound-from-link.py`), `routing.json` (which domains/IPs go through the VPN; everything else goes direct; corporate rules point to a `corp` freedom outbound chained through `vpn` via `proxySettings`, so hostnames are resolved locally over DoH and the VPN server receives IPs) and `inbounds-container.json` (what the gateway listens on: SOCKS/HTTP proxies, `dokodemo-door` port forwards to DB hosts, and ports 22/443 forwarded to the corporate git host with TLS sniffing). The container gets `--network-alias <corporate-host>` for every corporate hostname, so session containers resolve e.g. `git.example.com` to the gateway over Docker DNS and need no proxy settings at all: only corporate destinations go through the VPN, everything else (Claude API, package registries) goes direct. The same `outbound.json` + `routing.json` with `inbounds-host.json` serve the host (systemd user service), so Chrome, PhpStorm and the console share one routing policy. Examples: `<setup>/lib/project-template/vpn-config/`.
+If scripts or configs reference an external host via `127.0.0.1:<port>` (the typical sign of an SSH tunnel or socat relay on the host), or corporate hosts (git, tracker, DB) are reachable only through a VPN — **a service gateway container is needed** in the shared `cc-net` network. Container name: `cc-<project-name>-vpn`. Implementation: xray (`<setup>/lib/project-template/Dockerfile.vpn`, which also carries the API broker of Step 1.3a; a gateway without the broker drops the `python3`, `COPY` and `ENTRYPOINT` lines and runs `xray run` directly) that reads three config files from `vpn-config/`: `outbound.json` (the secret VPN outbound, generated from the provider's vless link by `<setup>/lib/xray-outbound-from-link.py`), `routing.json` (which domains/IPs go through the VPN; everything else goes direct; corporate rules point to a `corp` freedom outbound chained through `vpn` via `proxySettings`, so hostnames are resolved locally over DoH and the VPN server receives IPs) and `inbounds-container.json` (what the gateway listens on: SOCKS/HTTP proxies on 10808/10809, `dokodemo-door` port forwards to DB hosts, and the ssh and 443 ports forwarded to the corporate git host with TLS sniffing; the ssh forward uses the host's real ssh port, 22 in the template, e.g. 10022 when the corporate GitLab serves ssh there). The container gets `--network-alias <corporate-host>` for every corporate hostname, so session containers resolve e.g. `git.example.com` to the gateway over Docker DNS and need no proxy settings at all: only corporate destinations go through the VPN, everything else (Claude API, package registries) goes direct. The same `outbound.json` + `routing.json` with `inbounds-host.json` serve the host (systemd user service), so Chrome, PhpStorm and the console share one routing policy. Examples: `<setup>/lib/project-template/vpn-config/`.
+
+Git over ssh to a corporate host needs its host key in the image: the base `cc-image` pre-seeds `known_hosts` only for github.com, gitlab.com and bitbucket.org, and a non-interactive session cannot answer the host-key prompt. Put the `ssh-keyscan -p <port> <host>` output into `<setup>/<project-name>/ssh-known-hosts` (one line per host, the `[host]:port` form when the port is not 22) and let the project `Dockerfile` append it to `/home/claude/.ssh/known_hosts` (`COPY --chown=claude:claude ssh-known-hosts /tmp/ssh-known-hosts` + `RUN cat ... >> /home/claude/.ssh/known_hosts`).
+
+### 1.3a. Ticket tracker and code host API through the gateway
+If the session has to call a ticket tracker or a code-host API (merge requests, issue updates: the pipeline scripts in `~/.claude/scripts/` do this when the project has `.claude/ticket-services.json`), the API keys stay outside the session container. The gateway container runs `lib/api-broker.py` next to xray; the session reaches it as `TICKET_SERVICES_BROKER=http://cc-<project-name>-vpn:8080` and never sees the keys. What this needs:
+- `~/.config/ticket-services/<project-name>.env` on the host (directory 700, file 600): `TICKETHOST_API_KEY`, `CODEHOST_TOKEN`, and for hosts behind the VPN also `HTTPS_PROXY` (the host-side xray HTTP inbound, used by host-side runs of the same scripts), `TICKETHOST_URL`, `CODEHOST_URL`, `CODEHOST_PROJECT` (the broker builds its allow-list from the last three). The project `init.sh` checks that the file holds non-empty `TICKETHOST_API_KEY` and `CODEHOST_TOKEN` and reports what to fill in; it never creates the file. The broker reads every `*.env` in the directory, so the gateway of one project also sees the files of the others.
+- The whole directory mounted read-only into the gateway: `-v "$HOME/.config/ticket-services:/etc/ticket-services:ro"` in `VPN_CREATE_ARGS`.
+- `CONTAINER_ENV=("TICKET_SERVICES_BROKER=http://cc-<project-name>-vpn:8080")` in `ccd-config.sh`.
+- A project `Dockerfile.vpn` that installs `python3`, copies `lib/api-broker.py` and a `vpn-entrypoint.sh` starting xray and the broker in the background (`wait -n`, so the exit of either one stops the container; the broker goes upstream through the xray HTTP inbound `http://127.0.0.1:10809`). Because it copies from `lib/`, the image is built with the setup root as the build context: `docker build -t cc-<project-name>-vpn-image -f "$SCRIPT_DIR/Dockerfile.vpn" "$SCRIPT_DIR/.."`.
 
 ### 1.4. System requirements
 The base `cc-image` already carries document conversion for `~/.claude/scripts/pipeline-sources.sh` (`pdftotext`, `soffice`, `python3` + `openpyxl`). Do not re-install it per project. It also sets `LANG=C.UTF-8`: without a UTF-8 locale `soffice --convert-to txt:Text` replaces every non-ASCII character with `?`, so a Cyrillic docx converts to garbage. Do not unset or override `LANG` in a project Dockerfile.
@@ -85,11 +108,14 @@ Based on Step 1, ask the user separate questions:
 |---|---|
 | `<setup>/<project-name>/Dockerfile` (cc-image-<project-name>) | Step 1.4 found non-default requirements |
 | Service container (Dockerfile.<svc> + entrypoint + config) | Step 1.3 found a VPN/tunnel OR the project needs a dedicated service |
+| API broker in the gateway (`~/.config/ticket-services/<project-name>.env`, the read-only mount, `CONTAINER_ENV`, broker-enabled `Dockerfile.vpn`) | Step 1.3a: the session calls a ticket tracker or code-host API |
+| `ssh-known-hosts` appended into the project image | Step 1.3: git over ssh to a host other than github.com / gitlab.com / bitbucket.org |
+| `EXPOSE_GIT_PUSH=1` with `SSH_AGENT_KEY` | CC must push itself (the pipeline publishes merge requests). Name the one deploy key for this project; without `SSH_AGENT_KEY` the session gets the user's whole ssh-agent |
 | Non-empty `COMPOSE_NETWORKS` | Step 1.1 found compose networks CC must attach to |
 | Adapt scripts in `.claude/scripts/` | Step 1.2 found host-bound scripts that should run from the CC container |
 | `<projects-root>/<project-name>/.claude/<name>-credentials.env` | The project has passwords/keys the scripts need |
 
-If nothing beyond the base is needed, `<setup>/<project-name>/` only contains a minimal `init.sh` that generates `ccd-config.sh` (with empty `COMPOSE_NETWORKS=()` and empty `VPN_CONTAINER`).
+If nothing beyond the base is needed, `<setup>/<project-name>/` only contains a minimal `init.sh` that generates `ccd-config.sh` (with empty `COMPOSE_NETWORKS=()` and empty `VPN_CONTAINER`) and an empty `mcp.json`.
 
 **Do not act blindly**: at every decision, explicitly show the user what you found in Step 1, what you propose to do, and wait for confirmation.
 
@@ -102,6 +128,10 @@ ccd-config.sh                   # generated by init.sh; the wrapper config lives
 [ccd-pre-start.sh]              # optional; sourced by ccd before session launch — service container validation, config-hash checks
 mcp.json                        # generated empty by init.sh; project-level MCP servers. Source of truth lives here, not in <projects-root>/.../.mcp.json (read-only bind-mount + --strict-mcp-config in ccd → anti-tampering)
 [Dockerfile]                    # optional
+[ssh-known-hosts]               # optional; host keys of corporate git hosts, appended into the image by Dockerfile (Step 1.3)
+[Dockerfile.vpn]                # optional; the xray gateway, plus the API broker when Step 1.3a applies
+[vpn-entrypoint.sh]             # optional; only with the API broker: starts xray and api-broker.py together
+[vpn-config/]                   # optional; outbound.json (secret), routing.json, inbounds-*.json. May live outside the setup repo (~/.config/xray-<project-name>/), see Reference
 [Dockerfile.<svc>]              # optional
 [<svc>-entrypoint.sh]           # optional
 [<svc>-config/]                 # optional (secrets inside)
@@ -111,14 +141,24 @@ Inside `<projects-root>/<project-name>/.claude/`:
 ```
 [<name>-credentials.env]        # generated by init.sh, chmod 600
 [<mcp-server>-config.json]      # generated by init.sh, per-MCP-server config (e.g. playwright-mcp-config.json) — referenced from mcp.json by absolute path
+[cc-<project-name>-vpn.users]   # VPN refcount file plus its .lock, written by ccd when VPN_REFCOUNT_FILE points here (the template default)
 [scripts/]                      # adapted scripts, if any
 ```
+
+At the project root, next to `.claude/`: `.playwright-mcp/` (Playwright MCP output dir, created by the server) and `.chrome-devtools-mcp/` (Chrome DevTools MCP filesystem root, created by the project `init.sh`, Step 4 item 7.2).
+
+On the host, outside both folders: `~/.config/ticket-services/<project-name>.env` (Step 1.3a; filled in by the user by hand) and, optionally, `~/.config/xray-<project-name>/` for the VPN config shared with the host xray service.
 
 `bin/ccd` only bind-mounts `<setup>/<project-name>/mcp.json` from the setup folder into the container (read-only, at `/home/claude/.config/ccd/mcp.json`). Anything else an MCP server needs (its own `--config <path>` file) lives in `<projects-root>/<project-name>/.claude/` — it is visible to the container through the project bind-mount, and `mcp.json` references it by absolute path.
 
 `<setup>/<project-name>/` is excluded from the setup repo whitelist as a whole — secrets inside are safe.
 
-`<projects-root>/<project-name>/` is a separate project repo (if it is a git repo). In that case its `.gitignore` MUST ignore `db-credentials.env` (or whatever `*-credentials.env` you use) and any `*.env`. The project init.sh, when generating the credentials file, **MUST emit a warning** about this. If the project is not a git repo, the rule does not apply — secrets in `.claude/` are local by design.
+### Two project layouts
+
+The local files above (`*-credentials.env`, `<mcp-server>-config.json`, `*.users` and `*.users.lock`, `.playwright-mcp/`, `.chrome-devtools-mcp/`) must never be committed. Where they sit and who ignores them depends on the layout the user chose in Inputs:
+
+- **Internal project** (the user's own, started from scratch): `<projects-root>/<project-name>/` is itself the git repository and `.claude/` is committed in it. Its `.gitignore` MUST ignore `.claude/*-credentials.env`, `.claude/*-config.json` of MCP servers, `.claude/*.users`, `.claude/*.users.lock`, `.playwright-mcp/`, `.chrome-devtools-mcp/`. Add the missing entries as part of the connection and tell the user. The project init.sh, when generating the credentials file, **MUST emit a warning** that ignoring it is the project `.gitignore`'s job.
+- **External project** (repositories owned by someone else): `<projects-root>/<project-name>/` is a workspace folder, not a repository; the repositories are cloned inside it and `.claude/` lies in the workspace outside every repository, so nothing local can reach a repository. Nothing is added to those repositories: no files, no `.gitignore` edits. If a local file would have to sit inside a repository (an MCP output dir, a refcount file), move it to the workspace or to the host (`VPN_REFCOUNT_FILE="$HOME/.cache/ccd/cc-<project-name>-vpn.users"`) instead. `LOCK_GIT_INTERNALS` still covers every repository of the workspace: `ccd` finds `.git` directories up to depth 4 below the workspace root.
 
 ## Step 4. Implement `<setup>/<project-name>/init.sh`
 
@@ -152,16 +192,23 @@ done
 [ -d "$PROJECT_DIR" ] || cc_die "project $PROJECT_DIR not found"
 cc_log_skip "project found: $PROJECT_DIR"
 
-# 2. Copy secrets into <setup>/<project-name>/<svc>-config/ (if needed)
+# 2. Check that vpn-config/outbound.json exists (cc_die with the xray-outbound-from-link.py command if not); never generate it
 # 3. Build cc-image-<project-name> (if a Dockerfile exists, FROM cc-image)
-# 4. Build cc-<project-name>-<svc>-image (if a Dockerfile.<svc> exists, may be FROM any base)
+# 4. Build cc-<project-name>-<svc>-image (if a Dockerfile.<svc> exists, may be FROM any base;
+#    with the API broker the build context is the setup root, "$SCRIPT_DIR/..", because Dockerfile.vpn copies lib/api-broker.py)
 # 5. Generate <name>-credentials.env (chmod 600) — only if the file is missing, otherwise SKIP
-# 6. Generate ccd-config.sh (with VPN_IMAGE/VPN_CREATE_ARGS if VPN needed) — only if missing, otherwise SKIP with a missing-fields check
+# 5a. Check ~/.config/ticket-services/<project-name>.env (projects with the API broker): SKIP when it holds non-empty
+#     TICKETHOST_API_KEY and CODEHOST_TOKEN, otherwise cc_log_info naming the keys to fill in by hand
+#     (TICKETHOST_API_KEY, CODEHOST_TOKEN, HTTPS_PROXY, TICKETHOST_URL, CODEHOST_URL, CODEHOST_PROJECT; directory 700, file 600).
+#     Never create or write the file.
+# 6. Generate ccd-config.sh (with VPN_IMAGE/VPN_CREATE_ARGS/CONTAINER_ENV if VPN needed) — only if missing, otherwise SKIP with a missing-fields check
 # 6.1. Copy ccd-pre-start.sh from template — only if the file is missing (projects with VPN)
 # 7. Generate mcp.json (empty `{"mcpServers": {}}`) — only if the file is missing, otherwise SKIP
 # 7.1. Generate per-MCP-server configs in $PROJECT_DIR/.claude/<server>-config.json — only if missing,
 #      otherwise SKIP (same idempotency contract). Referenced from mcp.json by absolute path.
 #      Example content: README § MCP servers (playwright-mcp-config.json).
+# 7.2. mkdir -p $PROJECT_DIR/.chrome-devtools-mcp (projects with Chrome DevTools MCP: the --filesystem-root must exist
+#      before the server starts); SKIP when present
 # 8. Create service containers (config-hash based: source ccd-config.sh, compare hash of VPN_CREATE_ARGS
 #    against ccd.config-hash label on the container, recreate on mismatch)
 
@@ -172,7 +219,7 @@ cc_log_ok "$PROJECT_NAME/init.sh: ok"
 Every resource — `inspect → SKIP / create`. No unconditional actions that would clobber existing state.
 
 ### Do not overwrite existing configs
-`ccd-config.sh` and `<name>-credentials.env` are written ONLY when missing. If the file exists, compare its set of required keys against the template inside init.sh; on mismatch, emit `cc_log_info` with diagnostics and the user updates by hand.
+`ccd-config.sh` and `<name>-credentials.env` are written ONLY when missing. If the file exists, compare its set of required keys against the template inside init.sh; on mismatch, emit `cc_log_info` with diagnostics and the user updates by hand. `~/.config/ticket-services/<project-name>.env` and `vpn-config/outbound.json` are never written by init.sh at all, only checked.
 
 ### Flag cascade
 - `--rebuild` → rebuild ALL project images (including service containers based on a different image). Re-create service containers.
@@ -195,19 +242,33 @@ VPN_IMAGE=cc-<project-name>-vpn-image  # required for config-hash auto-recreatio
 VPN_CREATE_ARGS=(                      # extra docker create args for the gateway container
     --network-alias git.example.com    # one alias per corporate hostname the gateway serves
     -v "$SETUP_DIR/$PROJECT_NAME/vpn-config:/etc/xray:ro"
+    -v "$HOME/.config/ticket-services:/etc/ticket-services:ro"   # only with the API broker (Step 1.3a)
 )
+CONTAINER_ENV=("TICKET_SERVICES_BROKER=http://cc-<project-name>-vpn:8080")   # only with the API broker; empty () otherwise
 EXPOSE_GIT_IDENTITY=1   # CC commits as the user (sanitized bind-mount of ~/.gitconfig into /home/claude/.gitconfig:ro)
-EXPOSE_GIT_PUSH=0       # =1 — CC pushes via $SSH_AUTH_SOCK (access to every repo in ssh-agent!)
+EXPOSE_GIT_PUSH=0       # =1: CC pushes over ssh-agent, the dedicated agent with SSH_AGENT_KEY, or the user's whole $SSH_AUTH_SOCK without it
+SSH_AGENT_KEY=""        # private key file for the dedicated ccd agent, e.g. "$HOME/.ssh/<project-name>-deploy"; used only with EXPOSE_GIT_PUSH=1
 EXPOSE_GITCONFIG=0      # =1 — bind-mount ~/.gitconfig as-is, no sanitization (signingkey, credential.helper, url-rewrites)
+LOCK_GIT_INTERNALS=1    # .git/hooks and .git/config of every repo (depth 4) mounted :ro; =0 reopens git-RCE vectors
+LOCK_GITMODULES=0       # =1: .gitmodules mounted :ro (blocks git submodule add from the session)
 ```
 
-`$PROJECT_DIR` is set by the `bin/ccd` wrapper BEFORE it sources the config — inside the template this is the literal `$PROJECT_DIR`, not expanded at creation time.
+`$PROJECT_DIR` is set by the `bin/ccd` wrapper BEFORE it sources the config — inside the template this is the literal `$PROJECT_DIR`, not expanded at creation time. `$SETUP_DIR`, `$PROJECT_NAME` and `$HOME` are available the same way.
 
-`COMPOSE_NETWORKS` MUST be a **bash array**, not a string — the `ccd` wrapper iterates with `"${COMPOSE_NETWORKS[@]}"`. Empty array `()` = no compose networks attached.
+`COMPOSE_NETWORKS` MUST be a **bash array**, not a string — the `ccd` wrapper iterates with `"${COMPOSE_NETWORKS[@]}"`. Empty array `()` = no compose networks attached. `VPN_CREATE_ARGS` and `CONTAINER_ENV` are bash arrays too.
 
 `VPN_CONTAINER=""` (empty string) = VPN logic disabled; the wrapper does not perform any refcount operations.
 
-The full reference table for every `ccd-config.sh` variable (including base ones: `IMAGE`, `COMPOSE_NETWORKS`, `VPN_CONTAINER`, etc.) is in `<setup>/README.md`, section "Project `ccd-config.sh` configuration". Template defaults: `IDENTITY=1, PUSH=0, GITCONFIG=0` — CC commits locally, the user reviews and pushes.
+`VPN_REFCOUNT_FILE`: `ccd` creates its directory and the file on first use and keeps a `<file>.lock` next to it. The template default `$PROJECT_DIR/.claude/cc-<project-name>-vpn.users` is for the internal layout; for an external project, or when two projects share one gateway, use `"$HOME/.cache/ccd/cc-<project-name>-vpn.users"` (then all sharing projects point at the same file, otherwise one project stops the gateway under the other).
+
+Variables not in the README table:
+
+| Variable | Type | Purpose |
+|---|---|---|
+| `CONTAINER_ENV` | bash array | `NAME=value` strings, each passed to `docker run` as `-e`. Used for `TICKET_SERVICES_BROKER`. Default `()`. |
+| `SSH_AGENT_KEY` | path | With `EXPOSE_GIT_PUSH=1`: `ccd` starts (or reuses) its own ssh-agent at `${XDG_RUNTIME_DIR:-/tmp}/ccd-agent-<project-name>.sock`, loads this one key into it (a passphrase is asked once, the agent outlives the session) and mounts that socket as `/ssh-agent`. The user's own agent with every other key is never exposed. `ccd` exits with an error when the file is missing. Unset: the host `$SSH_AUTH_SOCK` is mounted as before. |
+
+The reference table for `IMAGE`, `COMPOSE_NETWORKS`, `VPN_*`, `EXPOSE_GIT_*`, `LOCK_GIT_INTERNALS`, `LOCK_GITMODULES` is in `<setup>/README.md`, section "Project `ccd-config.sh` configuration". Template defaults: `IDENTITY=1, PUSH=0, GITCONFIG=0, LOCK_GIT_INTERNALS=1, LOCK_GITMODULES=0` — CC commits locally, the user reviews and pushes. Unset `EXPOSE_*` reads as `0`, unset `LOCK_GIT_INTERNALS` as `1`.
 
 ## Step 6. Adapt the project's host-bound scripts (if any from Step 1.2)
 
@@ -235,7 +296,7 @@ or via the root one:
 bash <setup>/init.sh --project <project-name>
 ```
 
-Expected: images created, service containers in `Created`, `ccd-config.sh` and `<name>-credentials.env` generated.
+Expected: images created, service containers in `Created`, `ccd-config.sh`, `mcp.json`, `<name>-credentials.env` and the per-MCP-server configs generated, `.chrome-devtools-mcp/` created when the server is configured. With the API broker, the `[..]` line about `~/.config/ticket-services/<project-name>.env` disappears once the user has filled the file in.
 
 ## Step 8. Verification
 
@@ -247,14 +308,18 @@ Inside the CC session:
 - `pwd` → `<projects-root>/<project-name>`.
 - `id` → `claude:claude` with the host UID/GID.
 - Compose services reachable: `nc -zv <service-hostname> <port>` for every network in `COMPOSE_NETWORKS`.
+- `/mcp` lists exactly the servers of `<setup>/<project-name>/mcp.json`; a browser server answers a trivial call (navigate to the app URL).
+- With a gateway: `nc -zv cc-<project-name>-vpn <forwarded-port>` and `getent hosts <corporate-host>` resolve to the gateway. With the API broker: `curl -s "$TICKET_SERVICES_BROKER/gitlab/api/v4/version"` returns JSON, `curl -s -o /dev/null -w '%{http_code}' "$TICKET_SERVICES_BROKER/gitlab/api/v4/user"` returns 403 (not in the allow-list).
+- With `EXPOSE_GIT_PUSH=1` and `SSH_AGENT_KEY`: `ssh-add -l` shows that one key and nothing else; `git ls-remote <corporate-ssh-url>` works without a host-key prompt (the `ssh-known-hosts` line is in the image).
 - Adapted scripts work (the actual check is project-specific; e.g. a test SELECT through an adapted db-query.sh).
-- `/exit` — the `cc-<project-name>-<pid>` container is removed by `--rm`. Service containers are stopped if refcount is empty.
+- `/exit` — the `cc-<project-name>-<pid>` container is removed by `--rm`. Service containers are stopped if refcount is empty. No `ccd: WARNING` line about changed git internals on stderr (the audit of `.git/hooks`, `.git/config`, `.gitattributes`, `.gitmodules` that `ccd` runs at cleanup).
 
 After verification, the connection is complete. On a new machine the same project is brought up by copying `<setup>/<project-name>/` and running the root `init.sh`.
 
 ## Edge cases
 
-- On service-name collisions across projects, the `cc-<project-name>-<service>` convention guarantees isolation. Do NOT reuse service containers from other projects.
+- On service-name collisions across projects, the `cc-<project-name>-<service>` convention guarantees isolation. Do NOT reuse service containers from other projects, with one exception: several projects of the same corporate network may share one gateway (`VPN_CONTAINER=cc-<first-project>-vpn`) only when `VPN_CONTAINER`, `VPN_IMAGE`, `VPN_CREATE_ARGS` and `VPN_REFCOUNT_FILE` are identical in every sharing `ccd-config.sh` and the refcount file lives on the host (`$HOME/.cache/ccd/`). The config hash in `ccd-pre-start.sh` is computed from `VPN_CREATE_ARGS`: any difference between the projects recreates the gateway on every switch between them.
+- The dedicated ssh-agent of `SSH_AGENT_KEY` is per project (`ccd-agent-<project-name>.sock`) and is not stopped by `ccd`; `ssh-add -D` against that socket, or removing the socket, drops the key from memory.
 - If a project init.sh fails, the root `init.sh` is not blocked — it iterates onward. The final summary will show `[FAIL] project <name>`. The root's exit code becomes non-zero.
 - All secrets (vpn-config/outbound.json, db-credentials, anything project-specific) are generated ONLY when the file is missing. Never overwritten (see "Do not overwrite" in Step 4). The template (source of truth) lives inside the project init.sh; on field changes, old files are updated by hand after diagnostics.
 - `<setup>/<project-name>/` as a whole is excluded from the setup repo. Moving to a new machine — copy it, or connect from scratch using this spec.
@@ -279,7 +344,7 @@ Verified by end-to-end MCP JSON-RPC handshake on a project image (October 2026, 
 - **Browser resolution.** Without `--executablePath` the server calls puppeteer with `channel: 'chrome'`, which resolves only a system Google Chrome (`/opt/google/chrome/chrome`). The Playwright Chromium in `~/.cache/ms-playwright` is never considered, and `PUPPETEER_EXECUTABLE_PATH` is ignored because the channel is set. Install `google-chrome-stable` from `https://dl.google.com/linux/chrome/deb/` (amd64 only); it tracks the current stable on every rebuild, which is what the server requires.
 - **Sandbox.** Puppeteer does not add `--no-sandbox` by itself. Pass `--chrome-arg=--no-sandbox` and `--chrome-arg=--disable-setuid-sandbox` (the `--chrome-arg=<flag>` form, one flag per argument). Add `--chrome-arg=--disable-dev-shm-usage`: docker's 64 MB `/dev/shm` crashes tabs on heavy pages.
 - **Baked binary, same rule as Playwright.** `"command": "/usr/local/bin/chrome-devtools-mcp"`, never `npx chrome-devtools-mcp@latest`: a newer server may need a newer Chrome than the image holds, and `npx` adds a network round-trip on every start.
-- **Filesystem root.** `--filesystem-root <projects-root>/<project>/.chrome-devtools-mcp` limits where `filePath` arguments may write. The directory must exist at server start (realpath is resolved once), so the project `init.sh` creates it; add it to the project `.gitignore` next to `.playwright-mcp`.
+- **Filesystem root.** `--filesystem-root <projects-root>/<project>/.chrome-devtools-mcp` limits where `filePath` arguments may write. The directory must exist at server start (realpath is resolved once), so the project `init.sh` creates it (Step 4, item 7.2); in the internal layout it is ignored by the project `.gitignore` next to `.playwright-mcp`, in the external layout it lies in the workspace (Step 3, "Two project layouts").
 - **Config discovery.** The server auto-loads `cd4a.config.json` from the working directory (the project root inside the container) unless `CHROME_DEVTOOLS_MCP_NO_CONFIG_DISCOVERY=1` is set in `env`. Set it: a config planted in the repo could otherwise add `chromeArg`, `proxyServer` or `executablePath`.
 - **Telemetry off.** `--no-usage-statistics` and `--no-performance-crux` (trace URLs would otherwise be sent to Google's CrUX API), `CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS=1`.
 - **Reaching the app.** The CC container is on `COMPOSE_NETWORKS`, so the app is `http://<compose-service-container>/`, or `http://host.docker.internal:<host-port>/` through the published port. `localhost:<port>` from the project README is the host's address and does not resolve inside the container.
@@ -293,7 +358,8 @@ Verified by end-to-end MCP JSON-RPC handshake on a project image (October 2026, 
 | `init.sh` | full project init.sh example: image `cc-image-expro` (FROM `cc-image`), service `cc-expro-vpn-image` (FROM `debian:bookworm-slim`), check that `vpn-config/outbound.json` exists, generation of `db-credentials.env` and `ccd-config.sh` without overwriting, config-hash based `docker create` for `cc-expro-vpn`, the flag cascade `--rebuild` / `--rebuild-base-derived` |
 | `ccd-pre-start.sh` | pre-start hook: validates VPN container config hash, recreates on drift. Sourced by `ccd` before every session launch |
 | `Dockerfile` | minimal `FROM cc-image` with commented-out extension examples (postgres-client, Playwright). Drop it if the base `cc-image` is enough for the project |
-| `Dockerfile.vpn` | gateway: bare xray reading `/etc/xray/{outbound,routing,inbounds-container}.json`. Copied into the project unchanged; all specifics live in `vpn-config/`. Keep `XRAY_VERSION` at v26.3.27 or newer: the chained `corp` outbound breaks HTTPS on 25.x |
+| `Dockerfile.vpn` | gateway: xray reading `/etc/xray/{outbound,routing,inbounds-container}.json` plus the API broker (Step 1.3a): `python3`, `COPY lib/api-broker.py`, `COPY expro/vpn-entrypoint.sh` and that entrypoint, so it is built from the setup root. Copied into the project with `expro` replaced by `<project-name>`; all other specifics live in `vpn-config/`. A gateway without the broker drops the broker lines and runs `xray run` directly. Keep `XRAY_VERSION` at v26.3.27 or newer: the chained `corp` outbound breaks HTTPS on 25.x |
+| `vpn-entrypoint.sh` | gateway entrypoint: xray and `api-broker.py` in the background, `wait -n` so the exit of either stops the container; copied into the project as is |
 | `vpn-config/` | anonymized `routing.json`, `inbounds-host.json`, `inbounds-container.json`. `outbound.json` is a secret and is not in the template |
 | `mcp.json` | empty `{"mcpServers": {}}`. Filled in by hand or generated by the project init.sh |
 

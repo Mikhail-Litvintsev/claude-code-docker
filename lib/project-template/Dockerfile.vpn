@@ -1,10 +1,15 @@
+# Gateway: xray tunnel plus the API broker (lib/api-broker.py).
+# Build context is the setup root (init.sh passes "$SCRIPT_DIR/.."): the COPY lines
+# below read lib/ and the project folder. Replace expro with the project name.
 FROM debian:bookworm-slim
 ARG XRAY_VERSION=v26.3.27
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl unzip ca-certificates \
+        curl unzip ca-certificates python3 \
     && rm -rf /var/lib/apt/lists/*
 RUN curl -fsSL "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" -o /tmp/xray.zip \
     && unzip -j /tmp/xray.zip xray -d /usr/local/bin/ \
     && chmod +x /usr/local/bin/xray \
     && rm /tmp/xray.zip
-ENTRYPOINT ["xray", "run", "-c", "/etc/xray/outbound.json", "-c", "/etc/xray/routing.json", "-c", "/etc/xray/inbounds-container.json"]
+COPY lib/api-broker.py /usr/local/bin/api-broker.py
+COPY expro/vpn-entrypoint.sh /usr/local/bin/vpn-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/vpn-entrypoint.sh"]

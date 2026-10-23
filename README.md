@@ -31,10 +31,15 @@ Tested on **Ubuntu 22.04+**. A host-side `claude` binary is not required — `cc
     ├── ccd-pre-start.sh (opt.)             hook sourced by ccd before session launch
     ├── mcp.json                            project-level MCP
     ├── Dockerfile (opt.) FROM cc-image
+    ├── ssh-known-hosts (opt.)              host keys of corporate git hosts, appended into the image by Dockerfile
+    ├── Dockerfile.vpn + vpn-config/ (opt.) xray gateway; vpn-entrypoint.sh when it also runs the API broker
     └── Dockerfile.<svc> + <svc>-config/ (opt.) service containers
 
-<projects-root>/<project-name>/             project source (separate repo)
-└── .claude/{<name>-credentials.env, scripts/}
+<projects-root>/<project-name>/             project source (separate repo, or a workspace over repos)
+└── .claude/{<name>-credentials.env, <mcp-server>-config.json, cc-<project-name>-vpn.users, scripts/}
+
+~/.config/ticket-services/<project-name>.env  API keys of the ticket tracker and code host; mounted read-only into the gateway only
+~/.config/xray-<project-name>/ (opt.)       vpn-config shared with the host xray service instead of <setup>/<project-name>/vpn-config/
 ```
 
 | Resource | Purpose |
@@ -47,7 +52,7 @@ Tested on **Ubuntu 22.04+**. A host-side `claude` binary is not required — `cc
 | `claude-cc-bin` (volume) | Claude Code binary, warmed up by `ccd` |
 | `cc-<project>-<pid>` | ephemeral per-session container (`--rm`) |
 | `cc-<project>-<svc>` | service container (refcount-managed by `ccd`) |
-| `cc-<project>-vpn` | gateway: xray tunnel plus the API broker (`lib/api-broker.py`) that keeps the service keys in the gateway (`~/.config/ticket-services/` mounted read-only) and forwards only the routes of its allow-list; session containers reach it as `TICKET_SERVICES_BROKER` |
+| `cc-<project>-vpn` | gateway: xray tunnel plus the API broker (`lib/api-broker.py`) that keeps the service keys in the gateway (`~/.config/ticket-services/` mounted read-only) and forwards only the routes of its allow-list; session containers reach it as `TICKET_SERVICES_BROKER` (`http://cc-<project>-vpn:8080`, passed through `CONTAINER_ENV`) |
 
 ---
 
@@ -139,7 +144,9 @@ A bash file with variables for the `ccd` wrapper. Lives in `<setup>/<project>/`,
 | `VPN_CONTAINER` | string | VPN container name. `""` — no VPN. |
 | `VPN_REFCOUNT_FILE` | path | Refcount file for active sessions holding the VPN open. |
 | `VPN_IMAGE` | string | (opt.) VPN container image. Required for config-hash auto-recreation. |
-| `VPN_CREATE_ARGS` | bash array | (opt.) Extra `docker create` args for the VPN container (`--network-alias <corporate-host>` per hostname it serves, volumes). |
+| `VPN_CREATE_ARGS` | bash array | (opt.) Extra `docker create` args for the VPN container (`--network-alias <corporate-host>` per hostname it serves, volumes such as `vpn-config` and `~/.config/ticket-services` read-only). |
+| `CONTAINER_ENV` | bash array | (opt.) `NAME=value` strings, each passed to the session container as `-e`. Used for `TICKET_SERVICES_BROKER`. Default `()`. |
+| `SSH_AGENT_KEY` | path | (opt.) With `EXPOSE_GIT_PUSH=1`: `ccd` starts (or reuses) a dedicated ssh-agent at `${XDG_RUNTIME_DIR:-/tmp}/ccd-agent-<project>.sock`, loads only this key into it and mounts that socket as `/ssh-agent`; the user's own agent is never exposed. `ccd` exits with an error when the file is missing. Unset: the host `$SSH_AUTH_SOCK` is mounted. |
 
 ### Pre-start hook
 
@@ -167,7 +174,7 @@ What flags do **not** close: local history mutations (`rebase`, `reset --hard`, 
 | Variable | Default | What's exposed | Risk |
 |---|---|---|---|
 | `EXPOSE_GIT_IDENTITY` | `1` | sanitized `~/.gitconfig` + `[includeIf]` includes as `:ro` — `git commit` works with normal cascade | minimal |
-| `EXPOSE_GIT_PUSH` | `0` | `$SSH_AUTH_SOCK` — `git push` via every key in ssh-agent | medium |
+| `EXPOSE_GIT_PUSH` | `0` | an ssh-agent socket as `/ssh-agent`: without `SSH_AGENT_KEY` the host `$SSH_AUTH_SOCK`, so `git push` via every key of the user's agent; with `SSH_AGENT_KEY` a dedicated agent holding that one key | medium without `SSH_AGENT_KEY`, low with it |
 | `EXPOSE_GITCONFIG` | `0` | raw `~/.gitconfig` without sanitization — `signingkey`, `credential.helper`, `[url]` rewrites | high |
 
 When `EXPOSE_GIT_IDENTITY=1`, the global gitconfig has the following stripped: `[credential]`, `[gpg]`, `[http]`, `[https]`, all `[url "..."]`, `*.signingkey`, `core.sshCommand`/`askpass`/`hooksPath`, `commit.gpgsign`/`tag.gpgsign`. Preserved: `user.name`, `user.email`, `pull.*`, `merge.*`, `rebase.*`, `alias.*`, `[includeIf]`.
@@ -176,7 +183,7 @@ When `EXPOSE_GIT_IDENTITY=1`, the global gitconfig has the following stripped: `
 |---|---|---|---|---|
 | Read-only analysis | `0` | `0` | `0` | Third-party code, untrusted PR. |
 | **CC commits, user pushes** | `1` | `0` | `0` | **Default from the template.** |
-| Full freedom | `1` | `1` | `0` | Trusted personal project. |
+| Full freedom | `1` | `1` | `0` | Trusted personal project, or `1` with `SSH_AGENT_KEY` set to the project's deploy key. |
 | Custom gitconfig | — | — | `1` | GPG-signed commits, custom `[url]` rewrites. |
 
 Unset `EXPOSE_*` = `0` (fail-secure). Unset `LOCK_GIT_INTERNALS` = `1` (fail-secure).
@@ -269,13 +276,13 @@ CC runs with `--dangerously-skip-permissions`. Isolation:
 - Reach neighboring compose stacks via attached networks.
 
 **CANNOT:**
-- Read the host's `~/.ssh/`, `~/.aws/`, or `~/.config/`.
+- Read the host's `~/.ssh/`, `~/.aws/`, or `~/.config/`. `~/.config/ticket-services/` is mounted read-only into the gateway container only: the session never sees the directory or the keys, it reaches the ticket tracker and the code host through the broker's allow-listed routes.
 - Modify `~/.bashrc`/`authorized_keys`/cron.
 - Escalate to root via docker.sock.
 - Plant a malicious `.git/hooks/<name>` or `[alias] !cmd`/`[core] sshCommand` in per-repo `.git/config` (when `LOCK_GIT_INTERNALS=1`).
 
 **When the model breaks:**
-- `EXPOSE_GIT_PUSH=1` or `EXPOSE_GITCONFIG=1` — the agent gets ssh-agent / raw gitconfig.
+- `EXPOSE_GIT_PUSH=1` or `EXPOSE_GITCONFIG=1` — the agent gets ssh-agent (every key of the user's agent, or the one key of `SSH_AGENT_KEY`) / raw gitconfig.
 - `LOCK_GIT_INTERNALS=0` — git-RCE vectors reopen (`.git/hooks/`, per-repo `[alias]`/`sshCommand`/`[filter]`).
 - `-v /var/run/docker.sock:...` in a project Dockerfile, or publishing the proxy on a TCP port (`-p 2375:2375`).
 

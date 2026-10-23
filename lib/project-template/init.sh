@@ -52,6 +52,7 @@ else
 fi
 
 # === 4. cc-expro-vpn-image (FROM debian:bookworm-slim, not base-derived) =
+# Built from the setup root: Dockerfile.vpn copies lib/api-broker.py and expro/vpn-entrypoint.sh.
 need_rebuild_vpn_image=0
 if [ "$REBUILD" -eq 1 ]; then
     need_rebuild_vpn_image=1
@@ -61,7 +62,7 @@ fi
 
 if [ "$need_rebuild_vpn_image" -eq 1 ]; then
     cc_log_info "building cc-expro-vpn-image"
-    docker build -t cc-expro-vpn-image -f "$SCRIPT_DIR/Dockerfile.vpn" "$SCRIPT_DIR" \
+    docker build -t cc-expro-vpn-image -f "$SCRIPT_DIR/Dockerfile.vpn" "$SCRIPT_DIR/.." \
         || cc_die "failed to build cc-expro-vpn-image"
     cc_log_ok "cc-expro-vpn-image built"
 else
@@ -127,7 +128,17 @@ else
     )
     chmod 600 "$CRED_FILE"
     cc_log_ok "db-credentials.env created (chmod 600)"
-    cc_log_info "WARNING: $CRED_FILE is a secret; ignoring it is the responsibility of $PROJECT_DIR/.gitignore (project repo)"
+    cc_log_info "WARNING: $CRED_FILE is a secret. Internal project (the project folder is the repository): $PROJECT_DIR/.gitignore must ignore it. External project (a workspace over repositories): keep it in the workspace, outside every repository"
+fi
+
+# === 5a. ~/.config/ticket-services/expro.env (API keys read by the gateway broker) ==
+# Checked only, never written: the directory is mounted read-only into cc-expro-vpn
+# (VPN_CREATE_ARGS); the session container reaches the keys through TICKET_SERVICES_BROKER.
+TICKET_CRED_FILE="$HOME/.config/ticket-services/$PROJECT_NAME.env"
+if [ -f "$TICKET_CRED_FILE" ] && grep -qE '^TICKETHOST_API_KEY=.+' "$TICKET_CRED_FILE" && grep -qE '^CODEHOST_TOKEN=.+' "$TICKET_CRED_FILE"; then
+    cc_log_skip "$TICKET_CRED_FILE"
+else
+    cc_log_info "$TICKET_CRED_FILE: fill in TICKETHOST_API_KEY, CODEHOST_TOKEN, HTTPS_PROXY, TICKETHOST_URL, CODEHOST_URL and CODEHOST_PROJECT by hand (directory 700, file 600)"
 fi
 
 # === 6. ccd-config.sh ================================================
@@ -141,9 +152,12 @@ VPN_IMAGE=cc-expro-vpn-image
 VPN_CREATE_ARGS=(
     --network-alias git.example.com
     -v "$SETUP_DIR/$PROJECT_NAME/vpn-config:/etc/xray:ro"
+    -v "$HOME/.config/ticket-services:/etc/ticket-services:ro"
 )
+CONTAINER_ENV=("TICKET_SERVICES_BROKER=http://cc-expro-vpn:8080")
 EXPOSE_GIT_IDENTITY=1
 EXPOSE_GIT_PUSH=0
+SSH_AGENT_KEY=""
 EXPOSE_GITCONFIG=0
 LOCK_GIT_INTERNALS=1
 LOCK_GITMODULES=0'
@@ -177,6 +191,17 @@ else
     printf '{\n  "mcpServers": {}\n}\n' > "$MCP_CFG"
     chmod 644 "$MCP_CFG"
     cc_log_ok "mcp.json created (empty template; add servers manually)"
+fi
+
+# === 6.6. .chrome-devtools-mcp (filesystem root of chrome-devtools-mcp) ===
+# The --filesystem-root of the server must exist before it starts.
+# Drop this step if the project has no Chrome DevTools MCP in mcp.json.
+CDT_OUT_DIR="$PROJECT_DIR/.chrome-devtools-mcp"
+if [ -d "$CDT_OUT_DIR" ]; then
+    cc_log_skip ".chrome-devtools-mcp"
+else
+    mkdir -p "$CDT_OUT_DIR"
+    cc_log_ok ".chrome-devtools-mcp created"
 fi
 
 # === 7. cc-expro-vpn (container; create without run) =================

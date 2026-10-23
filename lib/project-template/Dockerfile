@@ -60,6 +60,14 @@ USER root
 #     && rm -rf /var/lib/apt/lists/*
 # RUN npm install -g chrome-devtools-mcp
 
+# Example: host key of a corporate git host (git over ssh to anything other than
+# github.com / gitlab.com / bitbucket.org, which cc-image already knows).
+# Create <setup>/<project>/ssh-known-hosts on the host first:
+#   ssh-keyscan -p <port> <host> > <setup>/<project>/ssh-known-hosts
+# The file holds the keys of a specific host, so it is not part of the template.
+# COPY --chown=claude:claude ssh-known-hosts /tmp/ssh-known-hosts
+# RUN cat /tmp/ssh-known-hosts >> /home/claude/.ssh/known_hosts && rm /tmp/ssh-known-hosts
+
 USER claude
 
 # RUN playwright install chromium
