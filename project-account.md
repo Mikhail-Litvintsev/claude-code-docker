@@ -5,7 +5,7 @@ Checklist for a project that must run on a separate claude.ai account (its own P
 Prerequisites, already in place after `bash <setup>/init.sh`:
 
 - the guard hook `<setup>/lib/claude-account-guard.sh` is registered in `~/.claude/settings.json` (check: `jq '.hooks.UserPromptSubmit' ~/.claude/settings.json` lists it);
-- every host launcher of `claude` goes through `<setup>/bin/claude-host` (shell alias, remote-control bridge, IDE plugin command). A launcher that bypasses it still cannot send prompts under the wrong account, the guard hook stops them, but it cannot pick the right account either.
+- `<setup>/bin` is first in PATH (check: `type -P claude` prints `<setup>/bin/claude`, a symlink to `claude-host`), so a plain `claude` picks the project account. Tools that locate the binary themselves (a remote-control bridge, an IDE plugin with its own command setting) must point at `<setup>/bin/claude-host`; one that bypasses it cannot send prompts under the wrong account, the guard hook stops them, but it cannot pick the right account either.
 
 ## 1. Bind the project
 
@@ -37,10 +37,10 @@ Nothing else is needed on the ccd side: the shared host files (`CLAUDE.md`, `set
 
 ```bash
 cd <projects-root>/<project-name>
-claude            # the alias or launcher that ends in <setup>/bin/claude-host
+claude            # resolves to <setup>/bin/claude, a symlink to claude-host
 ```
 
-`claude-host` creates `~/.claude-<slug>` with symlinks to the shared files of `~/.claude` and starts Claude Code with `CLAUDE_CONFIG_DIR` pointing there. The directory starts with an empty `.claude.json`, so three things happen once:
+`claude-host` (reached through the `claude` symlink) creates `~/.claude-<slug>` with symlinks to the shared files of `~/.claude` and starts Claude Code with `CLAUDE_CONFIG_DIR` pointing there. The directory starts with an empty `.claude.json`, so three things happen once:
 
 1. Onboarding and `/login`: sign in with the account from `CLAUDE_ACCOUNT`; verify with `/status`.
 2. Workspace trust: accept the trust dialog for the project folder.
@@ -98,6 +98,7 @@ rm -r ~/.claude-<slug>
 | Prompt refused with `... runs as an unknown account` | Not logged in yet in this config dir, or the login state file is missing. Run `/login`. |
 | Prompt refused with `ANTHROPIC_API_KEY overrides the login` (or `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`) | The environment forces another credential. Unset the variable in the shell or the launcher and restart. |
 | `claude-host: no claude binary in PATH` | The real binary is not in `PATH` of the launcher's environment. Set `CCD_HOST_CLAUDE=/path/to/claude` where the launcher runs. |
+| `claude-host: re-entered 9 times` | A script named `claude` on PATH execs `claude-host`, which then picks that script as the real binary. Replace the script with a symlink to `claude-host`, or set `CCD_HOST_CLAUDE`. |
 | Skills, agents or `CLAUDE.md` missing in a host session of the account | `~/.claude-<slug>` was created before those entries existed in `~/.claude`; `claude-host` adds the missing symlinks on the next start. Entries created in `~/.claude` after the first run are picked up the same way. |
 | `claude-host: ~/.claude-<slug>/<entry> is a real file, not a link` | Something replaced the symlink with a copy (a tool that writes files by rename). The copy no longer follows `~/.claude/<entry>`. Merge what differs into `~/.claude/<entry>`, delete the copy, start `claude-host` again to re-link. |
 | A phone-initiated or other daemon-spawned session uses the shared login | The daemon started without the launcher setting (`HAPPY_CLAUDE_PATH` for happy). Restart the daemon from a shell where the variable is exported. |

@@ -145,11 +145,19 @@ fi
 # === 5. PATH in ~/.bashrc =============================================
 BASHRC="$HOME/.bashrc"
 [ -f "$BASHRC" ] || touch "$BASHRC"
-PATH_LINE="export PATH=\"\$PATH:$SETUP_DIR/bin\"  # claude-code-docker:$SETUP_DIR"
+# <setup>/bin goes FIRST: it holds `claude` -> claude-host, so a plain `claude`
+# from any shell that loaded ~/.bashrc picks the project account by itself.
+PATH_LINE="export PATH=\"$SETUP_DIR/bin:\$PATH\"  # claude-code-docker:$SETUP_DIR"
 PATH_MARKER="# claude-code-docker:$SETUP_DIR"
 
-if grep -Fq "$PATH_MARKER" "$BASHRC"; then
+if grep -Fxq "$PATH_LINE" "$BASHRC"; then
     cc_log_skip "PATH: marker already in $BASHRC"
+elif grep -Fq "$PATH_MARKER" "$BASHRC"; then
+    path_tmp=$(mktemp)
+    awk -v marker="$PATH_MARKER" -v line="$PATH_LINE" 'index($0, marker) { print line; next } { print }' "$BASHRC" > "$path_tmp"
+    cat "$path_tmp" > "$BASHRC"
+    rm -f "$path_tmp"
+    cc_log_ok "PATH: marker line in $BASHRC rewritten to put $SETUP_DIR/bin first (apply: source $BASHRC or open a new terminal)"
 elif grep -Fq "$SETUP_DIR/bin" "$BASHRC"; then
     cc_log_skip "PATH: manual entry for $SETUP_DIR/bin found in $BASHRC; not appending the marker to avoid duplication"
 else
@@ -184,6 +192,7 @@ fi
 cc_log_info "IDE plugin: configure manually in Settings → Tools → Claude Code [Beta]"
 printf '         Claude command: %s/bin/ccd\n' "$SETUP_DIR" >&2
 printf '         Accept connections from all network interfaces: yes (required for env-injection)\n' >&2
+cc_log_info "tools that locate the claude binary themselves (remote-control bridges, other IDE plugins): point their command setting at $SETUP_DIR/bin/claude-host"
 
 # === 7. Run project init.sh scripts ===================================
 project_results=()
