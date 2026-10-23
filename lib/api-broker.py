@@ -25,7 +25,10 @@ REDMINE_ROUTES = [
     ('GET', re.compile(r'^/custom_fields\.json$')),
     ('PUT', re.compile(r'^/issues/\d+\.json$')),
 ]
-GITLAB_USERS = ('GET', re.compile(r'^/api/v4/users\?username=[^&]+$'))
+GITLAB_SHARED = [
+    ('GET', re.compile(r'^/api/v4/users\?username=[^&]+$')),
+    ('GET', re.compile(r'^/api/v4/version$')),
+]
 
 
 @dataclass
@@ -123,7 +126,7 @@ class Broker(BaseHTTPRequestHandler):
             for project in self.projects:
                 if allowed(method, path, project.routes()):
                     return project.url + path, {'PRIVATE-TOKEN': project.token}
-            if allowed(method, path, [GITLAB_USERS]):
+            if allowed(method, path, GITLAB_SHARED):
                 first = self.projects[0]
                 return first.url + path, {'PRIVATE-TOKEN': first.token}
         return None
@@ -159,7 +162,9 @@ def forward(method: str, url: str, headers: dict[str, str], body: bytes) -> tupl
     except urllib.error.HTTPError as error:
         return error.code, error.read(), error.headers.get('Content-Type')
     except (urllib.error.URLError, OSError) as error:
-        return 502, f'сервис недоступен: {getattr(error, "reason", error)}'.encode('utf-8'), 'text/plain; charset=utf-8'
+        reason = getattr(error, 'reason', error)
+        print(f'{method} {url} отказ: {reason}', flush=True)
+        return 502, f'сервис недоступен: {reason}'.encode('utf-8'), 'text/plain; charset=utf-8'
 
 
 def main() -> int:
