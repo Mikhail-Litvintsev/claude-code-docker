@@ -13,7 +13,7 @@ The setup is split into two parts:
 - `<setup>/lib/init-helpers.sh` — bash helper functions (logging, idempotent docker checks).
 - `<setup>/lib/xray-outbound-from-link.py` converts the VPN provider's vless link into the gateway's `outbound.json` (chmod 600).
 - `<setup>/lib/api-broker.py` is the API broker that runs inside the gateway container next to xray. It reads the service keys from `/etc/ticket-services/*.env` (the host directory `~/.config/ticket-services/` mounted read-only into the gateway), listens on port 8080, forwards an allow-list of ticket-tracker routes (`/redmine/...`) and code-host routes (`/gitlab/api/v4/...`) upstream with the key attached, and answers 403 to every other path. The keys never enter the session container; the session only knows the broker address from `TICKET_SERVICES_BROKER`.
-- `<setup>/init.sh` — root initializer: prerequisites, the shared `cc-net` network, the `claude-auth` volume, the `cc-docker-proxy` container, building `cc-image`, PATH wiring in `~/.bashrc`, then iterating `<setup>/*/init.sh`.
+- `<setup>/init.sh` — root initializer: prerequisites, the shared `cc-net` network, the `claude-auth` volume, the `cc-docker-proxy` container, building `cc-image`, PATH wiring in `~/.bashrc`, the account guard hook in `~/.claude/settings.json`, then iterating `<setup>/*/init.sh`.
 
 **Project settings** (NOT in the setup repo — local to each machine):
 - `<setup>/<project-name>/` — settings folder for a specific connected project. Paired with `<projects-root>/<project-name>/` (same name).
@@ -22,10 +22,11 @@ The root `init.sh` iterates `<setup>/*/init.sh`. A folder is identified by the p
 
 **What a session container gets from `bin/ccd`** (the full list; nothing else from the host reaches the session):
 - `<projects-root>/<project-name>/` bind-mounted read-write at the same absolute path, which is also the working directory. Inside it, `.git/hooks/` and `.git/config` of every repository found up to depth 4 are re-mounted read-only (`LOCK_GIT_INTERNALS=1`), and `.gitmodules` too when `LOCK_GITMODULES=1`.
-- The `claude-auth` volume at `/home/claude/.claude` (OAuth token shared by all projects) and the `claude-cc-bin` volume read-only at `/opt/claude`.
+- The `claude-auth` volume at `/home/claude/.claude` (OAuth token shared by all projects), or `claude-auth-<account-slug>` when `ccd-config.sh` sets `CLAUDE_ACCOUNT` (the login of that account only), and the `claude-cc-bin` volume read-only at `/opt/claude`.
 - The host's `~/.claude/CLAUDE.md`, `settings.json`, `settings.local.json`, `agents/`, `scripts/`, `output-styles/`, `guidelines/`, `skills/` read-only, each only if it exists on the host.
 - `<setup>/<project-name>/mcp.json` read-only at `/home/claude/.config/ccd/mcp.json`, passed to CC as `--mcp-config ... --strict-mcp-config`.
 - The sanitized `~/.gitconfig` (`EXPOSE_GIT_IDENTITY=1`), an ssh-agent socket at `/ssh-agent` (`EXPOSE_GIT_PUSH=1`), the raw `~/.gitconfig` (`EXPOSE_GITCONFIG=1`), the `-e` variables of `CONTAINER_ENV`.
+- `CCD_CLAUDE_ACCOUNT` (the value of `CLAUDE_ACCOUNT`, possibly empty) and `CCD_PROJECT_NAME` as `-e`, plus `<setup>/lib/claude-account.sh` and `<setup>/lib/claude-account-guard.sh` read-only at the same absolute paths: the `UserPromptSubmit` hook from the host `settings.json` that refuses prompts under another login than `CLAUDE_ACCOUNT`.
 - `DOCKER_HOST=tcp://cc-docker-proxy:2375`, `host.docker.internal` pointing at the host, the `cc-net` network plus every network of `COMPOSE_NETWORKS`.
 - Whatever the user-level hooks `~/.config/ccd/hooks.d/*.sh` (override: `CCD_HOOKS_DIR`) append to `EXTRA_FLAGS`; they are sourced right before `docker run` and are not part of a project.
 
@@ -114,6 +115,7 @@ Based on Step 1, ask the user separate questions:
 | Non-empty `COMPOSE_NETWORKS` | Step 1.1 found compose networks CC must attach to |
 | Adapt scripts in `.claude/scripts/` | Step 1.2 found host-bound scripts that should run from the CC container |
 | `<projects-root>/<project-name>/.claude/<name>-credentials.env` | The project has passwords/keys the scripts need |
+| `CLAUDE_ACCOUNT="<email>"` in `ccd-config.sh` | The project runs on its own claude.ai subscription, not the shared login. Procedure: `<setup>/project-account.md` |
 
 If nothing beyond the base is needed, `<setup>/<project-name>/` only contains a minimal `init.sh` that generates `ccd-config.sh` (with empty `COMPOSE_NETWORKS=()` and empty `VPN_CONTAINER`) and an empty `mcp.json`.
 
@@ -235,6 +237,7 @@ Template (init.sh writes this into `<setup>/<project-name>/ccd-config.sh`, chmod
 ```bash
 IMAGE=cc-image-<project-name>          # or cc-image, if no project Dockerfile
 CONTAINER_NAME_PREFIX=cc-<project-name>
+CLAUDE_ACCOUNT=""        # email of the claude.ai account whose subscription the project uses; "" = the shared login (README, Per-project Claude account)
 COMPOSE_NETWORKS=("net1" "net2")        # from Step 1.1; empty array () if none needed
 VPN_CONTAINER=cc-<project-name>-vpn     # empty string "", if VPN not needed
 VPN_REFCOUNT_FILE="$PROJECT_DIR/.claude/cc-<project-name>-vpn.users"
@@ -323,7 +326,7 @@ After verification, the connection is complete. On a new machine the same projec
 - If a project init.sh fails, the root `init.sh` is not blocked — it iterates onward. The final summary will show `[FAIL] project <name>`. The root's exit code becomes non-zero.
 - All secrets (vpn-config/outbound.json, db-credentials, anything project-specific) are generated ONLY when the file is missing. Never overwritten (see "Do not overwrite" in Step 4). The template (source of truth) lives inside the project init.sh; on field changes, old files are updated by hand after diagnostics.
 - `<setup>/<project-name>/` as a whole is excluded from the setup repo. Moving to a new machine — copy it, or connect from scratch using this spec.
-- Claude Code OAuth is a separate one-time step **after** the first `ccd` run: the `claude-cc-bin` volume is warmed up by the `ccd` wrapper automatically; on the first start, CC inside the container initiates the OAuth flow.
+- Claude Code OAuth is a separate one-time step **after** the first `ccd` run: the `claude-cc-bin` volume is warmed up by the `ccd` wrapper automatically; on the first start, CC inside the container initiates the OAuth flow. With `CLAUDE_ACCOUNT` set, the step repeats once in the project's own `claude-auth-<account-slug>` volume and the user must sign in with exactly that account; the guard hook refuses prompts under any other login.
 
 ### Playwright / browser smoke in a cap-drop=ALL container
 

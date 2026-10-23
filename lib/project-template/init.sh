@@ -145,6 +145,7 @@ fi
 CCD_CFG="$SCRIPT_DIR/ccd-config.sh"
 CCD_TEMPLATE='IMAGE=cc-image-expro
 CONTAINER_NAME_PREFIX=cc-expro
+CLAUDE_ACCOUNT=""
 COMPOSE_NETWORKS=("proxy" "expro-db")
 VPN_CONTAINER=cc-expro-vpn
 VPN_REFCOUNT_FILE="$PROJECT_DIR/.claude/cc-expro-vpn.users"

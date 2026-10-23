@@ -1,6 +1,6 @@
 # Claude Code Docker
 
-A wrapper that runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) inside per-project Docker containers. One OAuth token per host, a separate container per session, transparent integration with project compose networks and service containers (VPN, proxies, etc.).
+A wrapper that runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) inside per-project Docker containers. One OAuth login per host or one per project account, a separate container per session, transparent integration with project compose networks and service containers (VPN, proxies, etc.).
 
 Tested on **Ubuntu 22.04+**. A host-side `claude` binary is not required — `ccd` runs an isolated CC instance from the `claude-cc-bin` docker volume.
 
@@ -11,7 +11,7 @@ Tested on **Ubuntu 22.04+**. A host-side `claude` binary is not required — `cc
 - **`--dangerously-skip-permissions` without the risk.** CC runs without `Bash`/`Edit`/`Write` confirmations; protection is enforced at the container layer rather than via prompts: docker API through a whitelisted proxy, `--cap-drop=ALL` + `no-new-privileges`, sanitized git identity, no access to the host's `~/.ssh/`, `~/.aws/`, or `~/.bashrc`.
 - **One container, one project.** Bind-mounts only the current project directory.
 - **Compose-network attach.** Inside a session, `db`, `redis`, etc. are visible by their compose names.
-- **Shared OAuth token.** One-time OAuth, stored in the `claude-auth` volume, reused across projects.
+- **Shared or per-project OAuth login.** One-time OAuth, stored in the `claude-auth` volume and reused across projects; a project with its own Claude subscription gets its own volume and config dir (`CLAUDE_ACCOUNT`), and a guard hook refuses prompts under any other account.
 - **Idempotent bootstrap.** `init.sh` can be re-run safely — a repeat run rebuilds nothing.
 
 ---
@@ -20,11 +20,13 @@ Tested on **Ubuntu 22.04+**. A host-side `claude` binary is not required — `cc
 
 ```
 <setup>/                                    setup repository
-├── Dockerfile, init.sh, connect-project.md
+├── Dockerfile, init.sh, connect-project.md, project-account.md
 ├── bin/ccd                                 launcher wrapper
+├── bin/claude-host                         host-side claude launcher honoring the project account
 ├── cc-docker-proxy/haproxy.cfg             docker API whitelist
 ├── lib/init-helpers.sh, project-template/  helpers + project template
 ├── lib/api-broker.py                       API broker for the gateway container (keys stay in the gateway)
+├── lib/claude-account.sh, claude-account-guard.sh  project account resolution + UserPromptSubmit guard hook
 └── <project-name>/                         per-project settings (NOT in repo)
     ├── init.sh                             project initializer
     ├── ccd-config.sh                       generated (outside the project bind-mount — anti-tampering)
@@ -49,6 +51,7 @@ Tested on **Ubuntu 22.04+**. A host-side `claude` binary is not required — `cc
 | `cc-net` | docker network for service containers |
 | `cc-docker-proxy` | docker.sock proxy with whitelist |
 | `claude-auth` (volume) | shared OAuth token |
+| `claude-auth-<account>` (volume) | OAuth token of one project account (`CLAUDE_ACCOUNT`), created by `ccd` on first use |
 | `claude-cc-bin` (volume) | Claude Code binary, warmed up by `ccd` |
 | `cc-<project>-<pid>` | ephemeral per-session container (`--rm`) |
 | `cc-<project>-<svc>` | service container (refcount-managed by `ccd`) |
@@ -85,7 +88,7 @@ cd <projects-root>/<any-project>
 ccd
 ```
 
-The first run warms up `claude-cc-bin` (~30 sec) and CC initiates the OAuth flow inside the session. If auto-prompt does not fire, run `/login` inside the session. The token lives in `claude-auth` and is shared across all projects.
+The first run warms up `claude-cc-bin` (~30 sec) and CC initiates the OAuth flow inside the session. If auto-prompt does not fire, run `/login` inside the session. The token lives in `claude-auth` and is shared across all projects. A project with `CLAUDE_ACCOUNT` set repeats this step once in its own volume, see [Per-project Claude account](#per-project-claude-account).
 
 ---
 
@@ -97,7 +100,7 @@ ccd                       # interactive CC session
 ccd -- <claude-flag>      # pass flags through to the claude CLI
 ```
 
-`ccd` walks up from `$PWD` to the ancestor that has `<setup>/<basename>/ccd-config.sh`, reads the config, starts service containers under refcount, then launches the CC container with the project bind-mount and compose networks attached. On exit — `--rm` plus refcount-driven service-container cleanup.
+`ccd` walks up from `$PWD` to the ancestor that is `<projects-root>/<name>` with a `<setup>/<name>/ccd-config.sh` (a same-named folder elsewhere is not a project), reads the config, starts service containers under refcount, then launches the CC container with the project bind-mount and compose networks attached. On exit — `--rm` plus refcount-driven service-container cleanup.
 
 ---
 
@@ -113,6 +116,8 @@ ccd -- <claude-flag>      # pass flags through to the claude CLI
 4. `cd <projects-root>/<name> && ccd` — project services should be visible inside the session.
 
 `<setup>/<project-name>/` is excluded from the setup repo by the whitelist — it contains secrets.
+
+A project on its own Claude subscription additionally follows `project-account.md`.
 
 ---
 
@@ -140,6 +145,7 @@ A bash file with variables for the `ccd` wrapper. Lives in `<setup>/<project>/`,
 |---|---|---|
 | `IMAGE` | string | CC container image: `cc-image-<project>` or `cc-image`. |
 | `CONTAINER_NAME_PREFIX` | string | CC container name prefix (final name is `<prefix>-<pid>`). |
+| `CLAUDE_ACCOUNT` | string | (opt.) Email of the claude.ai account whose subscription this project uses. Empty or unset: the shared login. See [Per-project Claude account](#per-project-claude-account). |
 | `COMPOSE_NETWORKS` | bash array | List of compose networks. Empty `()` — no attach. |
 | `VPN_CONTAINER` | string | VPN container name. `""` — no VPN. |
 | `VPN_REFCOUNT_FILE` | path | Refcount file for active sessions holding the VPN open. |
@@ -189,6 +195,32 @@ When `EXPOSE_GIT_IDENTITY=1`, the global gitconfig has the following stripped: `
 Unset `EXPOSE_*` = `0` (fail-secure). Unset `LOCK_GIT_INTERNALS` = `1` (fail-secure).
 
 The XDG alternative (`~/.config/git/config`) is **not supported** — `bin/ccd` reads only `~/.gitconfig`. Either migrate, or configure per-repo via `git config --local`.
+
+---
+
+## Per-project Claude account
+
+By default every session, host-side and ccd, uses the one login in `~/.claude` / the `claude-auth` volume. A project that runs on its own Claude subscription sets the email of that account in its `ccd-config.sh` (step-by-step procedure: `project-account.md`):
+
+```bash
+CLAUDE_ACCOUNT="dev@example.com"
+```
+
+The file lives outside the project bind-mount, so a session cannot change the binding. The account email becomes a slug (`dev-example-com`: lowercase, every run of other characters replaced by `-`) that names the account's storage.
+
+**What it does**
+
+| Where | Mechanism |
+|---|---|
+| `ccd` | mounts the volume `claude-auth-<slug>` instead of `claude-auth` at `/home/claude/.claude`. The volume is created on first use and holds only this account's login, so no other login can exist inside the project's sessions. The shared host files (`CLAUDE.md`, `settings*.json`, `agents/`, `skills/`, ...) are mounted on top as before. |
+| `bin/claude-host` | host-side launcher. Finds the project from the current directory exactly like `ccd`; with `CLAUDE_ACCOUNT` it runs `claude` with `CLAUDE_CONFIG_DIR=~/.claude-<slug>`, otherwise it runs `claude` untouched. The directory is created on first use with symlinks to the shared files of `~/.claude` (the same list `ccd` mounts, plus `rules/`, `commands/`, `workflows/`, `plugins/`, `keybindings.json`, `themes/`); `.claude.json`, `.credentials.json` and `projects/` stay per account. The real binary is the first `claude` in `PATH` that is not the launcher itself; override with `CCD_HOST_CLAUDE=<path>`. |
+| guard hook | `lib/claude-account-guard.sh`, registered by `init.sh` as a `UserPromptSubmit` hook in `~/.claude/settings.json` (host sessions read it directly, ccd mounts the settings file and the two `lib/claude-account*.sh` scripts). On every prompt it compares the account the project is bound to with `oauthAccount` of the session's config dir and exits with code 2 on a mismatch: the prompt is not sent, the message names both accounts. `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` in the environment count as a mismatch, because they override the login. Inside a container the expected account comes from `CCD_CLAUDE_ACCOUNT`, set by `ccd`. |
+
+**Host launchers.** `CLAUDE_CONFIG_DIR` is read only from the environment `claude` starts with (project settings cannot set it, by design of Claude Code), so the choice has to happen in the launcher. Use `bin/claude-host` wherever `claude` is started: alias it in the shell, and point every tool that locates the binary itself (remote-control bridges, IDE plugins with a configurable command, cron jobs) at it. A session started past the launcher under the wrong login is stopped by the guard hook at its first prompt.
+
+**First run per account.** `ccd` prints the volume it creates; the first session walks through onboarding and `/login`, sign in with the account from `CLAUDE_ACCOUNT`. `bin/claude-host` does the same for `~/.claude-<slug>`. The new config dir starts with an empty `.claude.json`: trust the project folder again and re-add user-scope MCP servers there once.
+
+**Limits.** The guard blocks, it does not switch accounts: restart the session the right way. A directory `ccd` does not recognize as a project (a git worktree outside the project tree) gets no account and no check. `claude --bare` runs no settings hooks. Separate accounts do not add up usage limits; each session spends the subscription it is signed in with.
 
 ---
 
@@ -298,6 +330,7 @@ For **full** isolation from project compose containers (untrusted code) — use 
 | `[FAIL] 'docker compose' not working` | `apt install docker-compose-plugin`. |
 | Files owned by `nobody:nogroup` after `ccd` | UID/GID mismatch — `bash init.sh` will rebuild `cc-image`. |
 | OAuth flow does not start | run `/login` inside the session. |
+| Prompt refused with `bound to the Claude account ...` | the session runs under another login than `CLAUDE_ACCOUNT` of the project: start it through `ccd` or `bin/claude-host`, or `/login` with that account. |
 | `cc-<project>-vpn` does not start | `docker logs cc-<project>-vpn`, validate `<setup>/<project>/vpn-config/` with `xray run -test -c outbound.json -c routing.json -c inbounds-container.json`. |
 
 ---

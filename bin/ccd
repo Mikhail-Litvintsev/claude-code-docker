@@ -7,17 +7,9 @@ set -euo pipefail
 # EXPOSE_GIT_PUSH/EXPOSE_GITCONFIG. Project marker: basename(PWD-ancestor)
 # matches a folder in <setup>/ that has a ccd-config.sh.
 SETUP_DIR="$(realpath "$(dirname "${BASH_SOURCE[0]}")/..")"
-PROJECT_DIR="$(pwd)"
-PROJECT_NAME=""
-while [ "$PROJECT_DIR" != "/" ]; do
-    candidate=$(basename "$PROJECT_DIR")
-    if [ -f "$SETUP_DIR/$candidate/ccd-config.sh" ]; then
-        PROJECT_NAME="$candidate"
-        break
-    fi
-    PROJECT_DIR="$(dirname "$PROJECT_DIR")"
-done
-if [ -z "$PROJECT_NAME" ]; then
+# shellcheck source=/dev/null
+source "$SETUP_DIR/lib/claude-account.sh"
+if ! ccd_find_project "$SETUP_DIR" "$(pwd)"; then
     echo "ccd: project not found for $(pwd) — no ccd-config.sh for any ancestor under $SETUP_DIR/<name>/" >&2
     exit 1
 fi
@@ -28,11 +20,29 @@ VPN_CONTAINER=""
 VPN_REFCOUNT_FILE=""
 CONTAINER_ENV=()
 SSH_AGENT_KEY=""
+CLAUDE_ACCOUNT=""
 # shellcheck source=/dev/null
 source "$SETUP_DIR/$PROJECT_NAME/ccd-config.sh"
 
 : "${IMAGE:?ccd-config.sh must define IMAGE}"
 : "${CONTAINER_NAME_PREFIX:?ccd-config.sh must define CONTAINER_NAME_PREFIX}"
+
+# 2.1 Claude account of the project. A project with CLAUDE_ACCOUNT gets its own
+# auth volume, so no other login can exist inside its sessions; without it the
+# shared claude-auth volume is used. The container learns the expected account
+# through CCD_CLAUDE_ACCOUNT and lib/claude-account-guard.sh (a UserPromptSubmit
+# hook from the host settings.json) refuses prompts under any other login.
+CLAUDE_ACCOUNT=$(ccd_trim "$CLAUDE_ACCOUNT")
+CLAUDE_AUTH_VOLUME=claude-auth
+ensure_account_volume() {
+    [ -n "$CLAUDE_ACCOUNT" ] || return 0
+    docker volume inspect "$CLAUDE_AUTH_VOLUME" >/dev/null 2>&1 && return 0
+    echo "ccd: creating auth volume $CLAUDE_AUTH_VOLUME for the Claude account $CLAUDE_ACCOUNT (log in with it in the first session)" >&2
+    docker volume create "$CLAUDE_AUTH_VOLUME" >/dev/null
+}
+if [ -n "$CLAUDE_ACCOUNT" ]; then
+    CLAUDE_AUTH_VOLUME=$(ccd_account_volume "$CLAUDE_ACCOUNT")
+fi
 
 CC_VOLUME=claude-cc-bin
 CC_MOUNT=/opt/claude
@@ -85,6 +95,7 @@ ensure_cc_in_volume() {
 }
 
 ensure_cc_in_volume
+ensure_account_volume
 
 if ! docker network inspect cc-net >/dev/null 2>&1; then
     echo "ccd: cc-net not found — run <setup>/init.sh first" >&2
@@ -231,6 +242,10 @@ fi
 for container_env in ${CONTAINER_ENV[@]:+"${CONTAINER_ENV[@]}"}; do
     EXTRA_FLAGS+=( -e "$container_env" )
 done
+EXTRA_FLAGS+=( -e "CCD_CLAUDE_ACCOUNT=$CLAUDE_ACCOUNT" -e "CCD_PROJECT_NAME=$PROJECT_NAME" )
+for account_lib in claude-account.sh claude-account-guard.sh; do
+    EXTRA_FLAGS+=( -v "$SETUP_DIR/lib/$account_lib:$SETUP_DIR/lib/$account_lib:ro" )
+done
 
 if [ "${EXPOSE_GITCONFIG:-0}" = "1" ] && [ -f "$HOME/.gitconfig" ]; then
     EXTRA_FLAGS+=( -v "$HOME/.gitconfig:$CONTAINER_HOME/.gitconfig:ro" )
@@ -303,28 +318,13 @@ if [ -n "${CLAUDE_CODE_SSE_PORT:-}" ]; then
     fi
 fi
 
-# 4. Global skills
-if [ -d "$HOME/.claude/skills" ]; then
-    EXTRA_FLAGS+=( -v "$HOME/.claude/skills:/home/claude/.claude/skills:ro" )
-fi
-
-# 5. ~/.claude/ pass-through — mount only what exists:
+# 4. ~/.claude/ pass-through — mount only what exists:
 # a non-existent path would be created by docker as an empty dir owned by root.
-GLOBAL_CLAUDE_PATHS=(
-    "$HOME/.claude/CLAUDE.md:/home/claude/.claude/CLAUDE.md"
-    "$HOME/.claude/settings.json:/home/claude/.claude/settings.json"
-    "$HOME/.claude/settings.local.json:/home/claude/.claude/settings.local.json"
-    "$HOME/.claude/agents:/home/claude/.claude/agents"
-    "$HOME/.claude/scripts:/home/claude/.claude/scripts"
-    "$HOME/.claude/output-styles:/home/claude/.claude/output-styles"
-    "$HOME/.claude/guidelines:/home/claude/.claude/guidelines"
-)
+# The list is shared with the host account dirs (lib/claude-account.sh).
 GLOBAL_CLAUDE_MOUNTS=()
-for entry in "${GLOBAL_CLAUDE_PATHS[@]}"; do
-    src="${entry%%:*}"
-    dst="${entry##*:}"
-    if [ -e "$src" ]; then
-        GLOBAL_CLAUDE_MOUNTS+=(-v "${src}:${dst}:ro")
+for entry in "${CCD_SHARED_CLAUDE_ENTRIES[@]}"; do
+    if [ -e "$HOME/.claude/$entry" ]; then
+        GLOBAL_CLAUDE_MOUNTS+=(-v "$HOME/.claude/$entry:$CONTAINER_HOME/.claude/$entry:ro")
     fi
 done
 
@@ -395,7 +395,7 @@ docker run -d --rm --name "$CONTAINER_NAME" \
     --add-host=host.docker.internal:host-gateway \
     --cap-drop=ALL \
     --security-opt=no-new-privileges \
-    -v claude-auth:/home/claude/.claude \
+    -v "$CLAUDE_AUTH_VOLUME:/home/claude/.claude" \
     -v "$PROJECT_DIR:$PROJECT_DIR" \
     -v "$CC_VOLUME:$CC_MOUNT:ro" \
     -e "PATH=$CC_MOUNT/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \

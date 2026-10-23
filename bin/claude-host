@@ -1,0 +1,46 @@
+#!/bin/bash
+# Host-side claude launcher: when the current directory belongs to a project
+# with CLAUDE_ACCOUNT in its ccd-config.sh, runs claude with that account's
+# CLAUDE_CONFIG_DIR; otherwise runs claude untouched. Point every launcher
+# that locates the claude binary itself at this script.
+set -euo pipefail
+
+SETUP_DIR="$(realpath "$(dirname "${BASH_SOURCE[0]}")/..")"
+# shellcheck source=/dev/null
+source "$SETUP_DIR/lib/claude-account.sh"
+
+resolve_real_claude() {
+    if [ -n "${CCD_HOST_CLAUDE:-}" ]; then
+        printf '%s' "$CCD_HOST_CLAUDE"
+        return 0
+    fi
+    local self candidate
+    self=$(realpath "${BASH_SOURCE[0]}")
+    while read -r candidate; do
+        [ -n "$candidate" ] || continue
+        [ "$(realpath "$candidate")" = "$self" ] && continue
+        printf '%s' "$candidate"
+        return 0
+    done < <(type -aP claude 2>/dev/null)
+    return 1
+}
+
+CCD_CLAUDE_HOST_DEPTH=$(( ${CCD_CLAUDE_HOST_DEPTH:-0} + 1 ))
+export CCD_CLAUDE_HOST_DEPTH
+if [ "$CCD_CLAUDE_HOST_DEPTH" -gt 8 ]; then
+    echo "claude-host: re-entered $CCD_CLAUDE_HOST_DEPTH times; the claude in PATH leads back here. Set CCD_HOST_CLAUDE to the real binary." >&2
+    exit 1
+fi
+
+REAL_CLAUDE=$(resolve_real_claude) \
+    || { echo "claude-host: no claude binary in PATH (set CCD_HOST_CLAUDE to its path)" >&2; exit 1; }
+
+if ccd_find_project "$SETUP_DIR" "$PWD"; then
+    CLAUDE_ACCOUNT=$(ccd_project_account "$SETUP_DIR" "$PROJECT_NAME" "$PROJECT_DIR")
+    if [ -n "$CLAUDE_ACCOUNT" ]; then
+        CLAUDE_CONFIG_DIR=$(ccd_ensure_account_home_dir "$CLAUDE_ACCOUNT")
+        export CLAUDE_CONFIG_DIR
+    fi
+fi
+
+exec "$REAL_CLAUDE" "$@"

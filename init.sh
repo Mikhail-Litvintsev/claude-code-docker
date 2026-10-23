@@ -157,6 +157,29 @@ else
     cc_log_ok "PATH: appended to $BASHRC (apply: source $BASHRC or open a new terminal)"
 fi
 
+# === 5.5. Claude account guard hook in ~/.claude/settings.json =======
+# lib/claude-account-guard.sh runs on every prompt (host and ccd sessions)
+# and refuses it when the session's login differs from CLAUDE_ACCOUNT of
+# the project. Registered once; the command string is the marker.
+USER_SETTINGS="$HOME/.claude/settings.json"
+GUARD_COMMAND="$SETUP_DIR/lib/claude-account-guard.sh"
+mkdir -p "$(dirname "$USER_SETTINGS")"
+[ -f "$USER_SETTINGS" ] || printf '{}\n' > "$USER_SETTINGS"
+if jq -e --arg cmd "$GUARD_COMMAND" \
+        '[.hooks.UserPromptSubmit[]?.hooks[]? | select(.command == $cmd)] | length > 0' \
+        "$USER_SETTINGS" >/dev/null 2>&1; then
+    cc_log_skip "account guard hook already in $USER_SETTINGS"
+else
+    guard_tmp=$(mktemp)
+    jq --arg cmd "$GUARD_COMMAND" \
+        '.hooks.UserPromptSubmit = ((.hooks.UserPromptSubmit // []) + [{hooks: [{type: "command", command: $cmd}]}])' \
+        "$USER_SETTINGS" > "$guard_tmp" \
+        || { rm -f "$guard_tmp"; cc_die "failed to update $USER_SETTINGS (invalid JSON?)"; }
+    cat "$guard_tmp" > "$USER_SETTINGS"
+    rm -f "$guard_tmp"
+    cc_log_ok "account guard hook registered in $USER_SETTINGS"
+fi
+
 # === 6. IDE plugin — instructions only (not automated) ================
 cc_log_info "IDE plugin: configure manually in Settings → Tools → Claude Code [Beta]"
 printf '         Claude command: %s/bin/ccd\n' "$SETUP_DIR" >&2
@@ -207,7 +230,7 @@ fi
 # === 8. Final summary =================================================
 echo >&2
 cc_log_info "===== SUMMARY ====="
-cc_log_ok "shared steps: cc-net, claude-auth, cc-docker-proxy, cc-image, PATH, IDE instructions"
+cc_log_ok "shared steps: cc-net, claude-auth, cc-docker-proxy, cc-image, PATH, account guard hook, IDE instructions"
 
 any_fail=0
 if [ "${#project_results[@]}" -gt 0 ]; then
