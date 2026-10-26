@@ -82,6 +82,49 @@ If the session has to call a ticket tracker or a code-host API (merge requests, 
 - `CONTAINER_ENV=("TICKET_SERVICES_BROKER=http://cc-<project-name>-vpn:8080")` in `ccd-config.sh`.
 - A project `Dockerfile.vpn` that installs `python3`, copies `lib/api-broker.py` and a `vpn-entrypoint.sh` starting xray and the broker in the background (`wait -n`, so the exit of either one stops the container; the broker goes upstream through the xray HTTP inbound `http://127.0.0.1:10809`). Because it copies from `lib/`, the image is built with the setup root as the build context: `docker build -t cc-<project-name>-vpn-image -f "$SCRIPT_DIR/Dockerfile.vpn" "$SCRIPT_DIR/.."`.
 
+### 1.3b. Service secrets: issuing, checking, rotating
+The file `~/.config/ticket-services/<project-name>.env` (directory 700, file 600) is named after the project folder. Lines: `TICKETHOST_API_KEY`, `CODEHOST_TOKEN`; for services behind the VPN also `HTTPS_PROXY`, `TICKETHOST_URL`, `CODEHOST_URL`, `CODEHOST_PROJECT`. The session container never sees the keys: the directory is mounted read-only into the gateway and the broker adds them to the requests; host-side runs of the scripts read the file directly. Two projects of one company hold the same key and token, each in its own file.
+
+**Redmine API key.**
+- Where: `<tracker-url>/my/account`, the «API access key» block on the right, «Show». Rotation: «Reset» on the same page, then the new value into every file of that tracker.
+- What it is: the personal key of the user; it carries no rights of its own, it grants everything its owner may do in every project.
+- Server setting: «Administration, Settings, API», REST web service enabled. Without it every request is 403.
+- Rights of the user's role in the project: view issues (the ticket with journal, relations and attachments, the list of own open issues), edit issues (notes, status and assignee go in one request; «add notes» alone is not enough), the role's workflow transitions between the statuses of `allowed_statuses` and `moments` in `ticket-services.json` (else 422), and the reviewer of `moments.publish.assignee` in a role that can be assigned issues.
+- No administrator needed. Listing users by login is admin-only, so people in the config are ids, taken from the «Создана:» and «Назначена:» lines of a fetched ticket. Custom field names are admin-only too; without them the journal shows «поле N».
+- Through the broker: ticket and attachments, own issues, statuses, current user, custom fields, issue update. Everything else 403.
+
+**GitLab token.**
+- Where: `<gitlab-url>/-/user_settings/personal_access_tokens`, **Legacy token** (fine-grained tokens in this version bind to projects and resources, with no gain), name `ticket-services`, scope `api` only, expiry at will. Rotation: revoke the old one, issue a new one with the same parameters, write it into the files of every project on that GitLab.
+- Why `api`: creating a merge request works only with it; reading requests and looking up a user are included. `write_repository` is not needed: fetch and push go over ssh. It is needed only by a project without `codehost.git_url`, where the script pushes over https with the token.
+- Project role: Developer. The token grants nothing beyond the role. A bot token and a deploy key can only be created by a Maintainer, hence the personal token and the personal ssh key.
+- Project settings: the base branch protected on the server (a Developer cannot push to it, merge goes through the request); `codehost.reviewer` is a login resolved through `/users?username=`; deleting the source branch after merge is a flag of the request, no project setting.
+- Through the broker: list and create merge requests, update the description, look up a user by login, server version. Everything else 403.
+
+**Ssh key for git from the container.**
+- Issue: `ssh-keygen -t ed25519 -N '' -C ccd-<project-name> -f ~/.ssh/id_ed25519_ccd_<project-name>`; the public part into GitLab, «User settings, SSH Keys», usage type Authentication. The path goes into `SSH_AGENT_KEY` of the project's `ccd-config.sh` with `EXPOSE_GIT_PUSH=1`.
+- The container gets a separate ccd agent holding only this key. Rotation: a new key, replace it in GitLab and in `SSH_AGENT_KEY`, delete the old one from GitLab.
+- The host key of GitLab in the image: Step 1.3, `ssh-known-hosts`, the port from `codehost.git_url`.
+
+**GitHub token.**
+- `https://github.com/settings/personal-access-tokens/new`, fine-grained, on the project's repositories, permissions Contents read and write, Pull requests read and write, Administration read and write (turning on branch deletion after merge, a repository setting). The value goes into `CODEHOST_TOKEN` of the project's file.
+
+**Check after issuing.** From the project root on the host (for services behind the VPN from the session container, the host cannot reach them):
+
+```bash
+python3 - <<'PY'
+import os, sys
+from pathlib import Path
+sys.path.insert(0, os.path.expanduser('~/.claude/scripts'))
+from ticket_services import config as configuration, tickethost
+config = configuration.load(Path.cwd())
+host = tickethost.make(config)
+print('пользователь:', host.current_user().name)
+print('статусы:', ', '.join(sorted(host.load_statuses())))
+PY
+```
+
+It prints the key owner's name and the server's statuses; every status of `allowed_statuses` and `moments` must be in the list. GitLab: `curl -s -o /dev/null -w '%{http_code}\n' -H "PRIVATE-TOKEN: $(sed -n 's/^CODEHOST_TOKEN=//p' ~/.config/ticket-services/<project-name>.env)" <gitlab-url>/api/v4/user` prints 200. The broker from the container: `curl -s $TICKET_SERVICES_BROKER/redmine/users/current.json`. Ssh from the container: `git ls-remote <codehost.git_url> HEAD`. The whole path live: fetch a ticket that already sits in `moments.take.status`, so its status does not change: `python3 ~/.claude/scripts/ticket-fetch.py <number>`.
+
 ### 1.4. System requirements
 The base `cc-image` already carries document conversion for `~/.claude/scripts/pipeline-sources.sh` (`pdftotext`, `soffice`, `python3` + `openpyxl`). Do not re-install it per project. It also sets `LANG=C.UTF-8`: without a UTF-8 locale `soffice --convert-to txt:Text` replaces every non-ASCII character with `?`, so a Cyrillic docx converts to garbage. Do not unset or override `LANG` in a project Dockerfile.
 
@@ -149,7 +192,7 @@ Inside `<projects-root>/<project-name>/.claude/`:
 
 At the project root, next to `.claude/`: `.playwright-mcp/` (Playwright MCP output dir, created by the server) and `.chrome-devtools-mcp/` (Chrome DevTools MCP filesystem root, created by the project `init.sh`, Step 4 item 7.2).
 
-On the host, outside both folders: `~/.config/ticket-services/<project-name>.env` (Step 1.3a; filled in by the user by hand) and, optionally, `~/.config/xray-<project-name>/` for the VPN config shared with the host xray service.
+On the host, outside both folders: `~/.config/ticket-services/<project-name>.env` (Step 1.3a; filled in by the user by hand, the values per Step 1.3b) and, optionally, `~/.config/xray-<project-name>/` for the VPN config shared with the host xray service.
 
 `bin/ccd` only bind-mounts `<setup>/<project-name>/mcp.json` from the setup folder into the container (read-only, at `/home/claude/.config/ccd/mcp.json`). Anything else an MCP server needs (its own `--config <path>` file) lives in `<projects-root>/<project-name>/.claude/` — it is visible to the container through the project bind-mount, and `mcp.json` references it by absolute path.
 
